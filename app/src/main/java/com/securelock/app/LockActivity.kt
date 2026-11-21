@@ -1,356 +1,184 @@
 package com.securelock.app
 
-import android.Manifest
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.app.admin.DeviceAdminReceiver
-import android.app.admin.DevicePolicyManager
-import android.content.BroadcastReceiver
-import android.content.ComponentName
-import android.content.Context
+import android.app.Activity
 import android.content.Intent
-import android.content.SharedPreferences
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.SystemClock
-import android.provider.Settings
-import android.view.inputmethod.InputMethodManager
-import java.security.MessageDigest
-import java.security.SecureRandom
-import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Locale
+import android.graphics.Color
+import android.os.Bundle
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.widget.EditText
+import android.widget.LinearLayout
 
-fun norm(s: String): String =
-    s.lowercase(Locale.ROOT).replace("\u0307", "").replace('ı', 'i').trim()
+class LockActivity : Activity() {
+    private var pkg = ""
+    private var done = false
 
-class AdminReceiver : DeviceAdminReceiver()
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
+        UI.useTheme(this)
+        pkg = intent.getStringExtra("pkg") ?: ""
+        build()
+    }
 
-class EventReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        Policy.refresh(context)
-        val a = intent.action
-        if (a == Intent.ACTION_BOOT_COMPLETED || a == Intent.ACTION_MY_PACKAGE_REPLACED) {
-            if (Policy.rawMode(context) != 0) Policy.schedule(context, Policy.remaining(context))
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        pkg = intent?.getStringExtra("pkg") ?: ""
+        build()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        goHome()
+    }
+
+    private fun goHome() {
+        startActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+        finish()
+    }
+
+    private fun ok() {
+        if (done) return
+        done = true
+        GuardService.inst?.markUnlocked(pkg)
+        finish()
+        overridePendingTransition(0, 0)
+    }
+
+    private fun build() {
+        done = false
+        val check: (String) -> Boolean = { s -> Store.checkFor(this, pkg, s) }
+        val v: View = when (Store.typeFor(this, pkg)) {
+            Store.PIN -> pinView(check)
+            Store.PATTERN -> patternView(check)
+            else -> passView(check)
         }
-    }
-}
-
-class SecretReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-    }
-}
-
-object Feat {
-    val siki = listOf(
-        Triple("s_acc", "Erişilebilirlik sayfaları engelli", true),
-        Triple("s_date", "Tarih ve saat ile Genel yönetim engelli", true),
-        Triple("s_info", "Secure Lock bilgi ve kaldırma sayfaları engelli", false),
-        Triple("s_lock", "Oturumda şifreler ve özelleştirme kilitli", true),
-        Triple("s_keep", "Oturumda uygulama listesinden çıkarma yok", true)
-    )
-    val kati = listOf(
-        Triple("k_info", "Secure Lock bilgi ve kaldırma sayfaları engelli", true),
-        Triple("k_admin", "Cihaz yöneticisi sayfası engelli", true),
-        Triple("k_enter", "Katı Mod'da Secure Lock'a girilebilsin", false),
-        Triple("k_strike", "Sert ceza: en fazla 2 denemede ekran kilitlenir", true),
-        Triple("k_allset", "Ayarlar uygulaması tamamen engelli", false)
-    )
-
-    fun def(k: String): Boolean {
-        for (t in siki) if (t.first == k) return t.third
-        for (t in kati) if (t.first == k) return t.third
-        return false
-    }
-}
-
-object Clock {
-    private fun boot(c: Context): Int = try {
-        Settings.Global.getInt(c.contentResolver, Settings.Global.BOOT_COUNT, -1)
-    } catch (e: Exception) {
-        -1
+        setContentView(v)
     }
 
-    fun left(c: Context, n: String): Long {
-        val sp = Store.p(c)
-        val kw = "t_${n}_w"
-        if (!sp.contains(kw)) return 0L
-        val nowE = SystemClock.elapsedRealtime()
-        var endE = sp.getLong("t_${n}_e", 0L)
-        val savedE = sp.getLong("t_${n}_s", 0L)
-        val b = boot(c)
-        val rebooted = (b != -1 && b != sp.getInt("t_${n}_b", -1)) || nowE < savedE
-        val ed = sp.edit()
-        var dirty = false
-        if (rebooted) {
-            endE = nowE + maxOf(0L, sp.getLong(kw, 0L) - System.currentTimeMillis())
-            ed.putLong("t_${n}_e", endE).putLong("t_${n}_s", nowE).putInt("t_${n}_b", b)
-            dirty = true
-        } else if (nowE - savedE > 15000L) {
-            ed.putLong("t_${n}_s", nowE)
-            dirty = true
-        }
-        val r = endE - nowE
-        if (r <= 0L) {
-            clear(c, n)
-            return 0L
-        }
-        if (dirty) ed.apply()
+    private fun base(): LinearLayout {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.VERTICAL
+        r.setBackgroundColor(Color.BLACK)
+        r.setPadding(UI.dp(this, 24), UI.dp(this, 48), UI.dp(this, 24), UI.dp(this, 24))
         return r
     }
 
-    fun add(c: Context, n: String, ms: Long) {
-        val total = left(c, n) + ms
-        val nowE = SystemClock.elapsedRealtime()
-        Store.p(c).edit()
-            .putLong("t_${n}_e", nowE + total)
-            .putLong("t_${n}_s", nowE)
-            .putLong("t_${n}_w", System.currentTimeMillis() + total)
-            .putInt("t_${n}_b", boot(c))
-            .apply()
-    }
-
-    fun clear(c: Context, n: String) {
-        Store.p(c).edit()
-            .remove("t_${n}_w").remove("t_${n}_e").remove("t_${n}_s").remove("t_${n}_b")
-            .apply()
-    }
-}
-
-object Store {
-    const val PIN = 0
-    const val PASS = 1
-    const val PATTERN = 2
-
-    fun p(c: Context): SharedPreferences =
-        c.applicationContext.getSharedPreferences("sl", Context.MODE_PRIVATE)
-
-    private fun salt(c: Context): String {
-        var s = p(c).getString("salt", null)
-        if (s == null) {
-            val b = ByteArray(16)
-            SecureRandom().nextBytes(b)
-            s = b.joinToString("") { "%02x".format(it) }
-            p(c).edit().putString("salt", s).apply()
+    private fun pinView(check: (String) -> Boolean): View {
+        val len = Store.lenFor(this, pkg)
+        var buf = ""
+        val root = base()
+        val dots = UI.tv(this, "", 28f)
+        dots.gravity = Gravity.CENTER
+        val msg = UI.tv(this, " ", 15f, Color.parseColor("#E57373"))
+        msg.gravity = Gravity.CENTER
+        fun draw() {
+            dots.text = (0 until len).joinToString("  ") { if (it < buf.length) "●" else "○" }
         }
-        return s
-    }
-
-    private fun hash(c: Context, s: String): String =
-        MessageDigest.getInstance("SHA-256").digest((salt(c) + s).toByteArray())
-            .joinToString("") { "%02x".format(it) }
-
-    fun isSetup(c: Context) = p(c).contains("admin")
-    fun setAdmin(c: Context, s: String) { p(c).edit().putString("admin", hash(c, s)).apply() }
-    fun checkAdmin(c: Context, s: String) = p(c).getString("admin", null) == hash(c, s)
-    fun setStrict(c: Context, s: String) { p(c).edit().putString("strict", hash(c, s)).apply() }
-    fun checkStrict(c: Context, s: String) = p(c).getString("strict", null) == hash(c, s)
-
-    fun lockType(c: Context) = p(c).getInt("ltype", PIN)
-    fun pinLen(c: Context) = p(c).getInt("plen", 4)
-    fun setLock(c: Context, type: Int, s: String) {
-        p(c).edit().putInt("ltype", type).putInt("plen", s.length).putString("lock", hash(c, s)).apply()
-    }
-    fun checkLock(c: Context, s: String) = p(c).getString("lock", null) == hash(c, s)
-
-    fun hasAppLock(c: Context, pkg: String) = p(c).contains("ap_$pkg")
-    fun appType(c: Context, pkg: String) = p(c).getInt("apt_$pkg", PASS)
-    fun setAppLock(c: Context, pkg: String, type: Int, s: String) {
-        p(c).edit().putString("ap_$pkg", hash(c, s)).putInt("apt_$pkg", type).putInt("apl_$pkg", s.length).apply()
-    }
-    fun clearAppLock(c: Context, pkg: String) {
-        p(c).edit().remove("ap_$pkg").remove("apt_$pkg").remove("apl_$pkg").apply()
-    }
-    fun typeFor(c: Context, pkg: String) = if (hasAppLock(c, pkg)) appType(c, pkg) else lockType(c)
-    fun lenFor(c: Context, pkg: String) = if (hasAppLock(c, pkg)) p(c).getInt("apl_$pkg", 4) else pinLen(c)
-    fun checkFor(c: Context, pkg: String, s: String) =
-        if (hasAppLock(c, pkg)) p(c).getString("ap_$pkg", null) == hash(c, s) else checkLock(c, s)
-
-    fun blocked(c: Context): Set<String> =
-        HashSet<String>(p(c).getStringSet("blocked", emptySet()) ?: emptySet<String>())
-
-    // 1 = Normal kilit, 2 = Sıkı Mod'da engelle, 4 = Katı Mod'da engelle
-    fun tags(c: Context, pkg: String): Int {
-        val s = p(c).getStringSet("blocked", null) ?: return 0
-        if (!s.contains(pkg)) return 0
-        return p(c).getInt("tag_$pkg", 7)
-    }
-
-    fun setTags(c: Context, pkg: String, t: Int) {
-        val s = HashSet<String>(blocked(c))
-        val e = p(c).edit()
-        if (t == 0) {
-            s.remove(pkg)
-            e.remove("tag_$pkg")
-        } else {
-            s.add(pkg)
-            e.putInt("tag_$pkg", t)
+        draw()
+        root.addView(dots, LinearLayout.LayoutParams(-1, -2))
+        root.addView(msg, LinearLayout.LayoutParams(-1, -2))
+        val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "Çık", "0", "Sil")
+        val m = UI.dp(this, 5)
+        for (r in 0 until 4) {
+            val row = LinearLayout(this)
+            for (k in 0 until 3) {
+                val key = keys[r * 3 + k]
+                val b = UI.button(this, key, UI.CARD) {
+                    when (key) {
+                        "Çık" -> goHome()
+                        "Sil" -> {
+                            if (buf.isNotEmpty()) buf = buf.dropLast(1)
+                            draw()
+                        }
+                        else -> {
+                            if (buf.length < len) buf += key
+                            draw()
+                            if (buf.length == len) {
+                                if (check(buf)) {
+                                    ok()
+                                } else {
+                                    msg.text = "Yanlış"
+                                    buf = ""
+                                    draw()
+                                }
+                            }
+                        }
+                    }
+                }
+                b.textSize = 28f
+                val blp = LinearLayout.LayoutParams(0, -1, 1f)
+                blp.setMargins(m, m, m, m)
+                row.addView(b, blp)
+            }
+            root.addView(row, LinearLayout.LayoutParams(-1, 0, 1f))
         }
-        e.putStringSet("blocked", s).apply()
+        return root
     }
 
-    fun feat(c: Context, k: String) = p(c).getBoolean("f_$k", Feat.def(k))
-    fun setFeat(c: Context, k: String, v: Boolean) { p(c).edit().putBoolean("f_$k", v).apply() }
-    fun setInt(c: Context, k: String, v: Int) { p(c).edit().putInt(k, v).apply() }
-    fun setStr(c: Context, k: String, v: String) { p(c).edit().putString(k, v).apply() }
-
-    fun theme(c: Context) = p(c).getInt("theme", 0).coerceIn(0, 4)
-    fun ghostSecs(c: Context) = p(c).getInt("gsec", 3)
-    fun ghostMsg(c: Context): String = p(c).getString("gmsg", "Hayır.") ?: "Hayır."
-    fun strikeN(c: Context) = p(c).getInt("strike", 3)
-    fun relock(c: Context) = p(c).getInt("relock", 0)
-
-    private fun cal(off: Int): Calendar {
-        val c = Calendar.getInstance()
-        c.add(Calendar.DAY_OF_YEAR, -off)
-        return c
-    }
-    private fun key(off: Int): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(cal(off).time)
-    fun label(off: Int): String = SimpleDateFormat("EEE", Locale("tr")).format(cal(off).time)
-
-    fun addAttempt(c: Context) {
-        val k = "att_" + key(0)
-        p(c).edit().putInt(k, p(c).getInt(k, 0) + 1).apply()
-    }
-    fun addFocus(c: Context, m: Int) {
-        val k = "foc_" + key(0)
-        p(c).edit().putInt(k, p(c).getInt(k, 0) + m).apply()
-    }
-    fun att(c: Context, off: Int) = p(c).getInt("att_" + key(off), 0)
-    fun foc(c: Context, off: Int) = p(c).getInt("foc_" + key(off), 0)
-    fun streak(c: Context): Int {
-        var i = if (foc(c, 0) > 0) 0 else 1
-        var n = 0
-        while (i < 400 && foc(c, i) > 0) { n++; i++ }
-        return n
-    }
-}
-
-object Policy {
-    fun admin(c: Context) = ComponentName(c, AdminReceiver::class.java)
-    fun dpm(c: Context) = c.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-    fun adminActive(c: Context): Boolean = try {
-        dpm(c).isAdminActive(admin(c))
-    } catch (e: Exception) {
-        false
-    }
-    fun canSecure(c: Context) =
-        c.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED
-
-    fun rawMode(c: Context) = Store.p(c).getInt("s_mode", 0)
-
-    fun mode(c: Context): Int {
-        if (rawMode(c) == 0) return 0
-        refresh(c)
-        return rawMode(c)
-    }
-
-    fun refresh(c: Context) {
-        if (rawMode(c) != 0 && remaining(c) <= 0L) end(c)
-    }
-
-    fun remaining(c: Context): Long = Clock.left(c, "sess")
-
-    fun start(c: Context, mode: Int, ms: Long) {
-        Store.p(c).edit().putInt("s_mode", mode).putLong("s_ms", ms).apply()
-        Clock.clear(c, "sess")
-        Clock.add(c, "sess", ms)
-        setGray(c, true)
-        schedule(c, ms)
-    }
-
-    fun end(c: Context) {
-        if (rawMode(c) == 0) return
-        val min = (Store.p(c).getLong("s_ms", 0L) / 60000L).toInt()
-        Store.p(c).edit().putInt("s_mode", 0).apply()
-        Clock.clear(c, "sess")
-        setGray(c, false)
-        Store.addFocus(c, minOf(min, 1440))
-        try {
-            (c.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(pi(c))
-        } catch (e: Exception) {
-        }
-    }
-
-    // 0 = serbest, 1 = şifre kapısı, 2 = Hayalet Mod (kesin engel)
-    fun action(c: Context, pkg: String): Int {
-        val t = Store.tags(c, pkg)
-        if (t == 0) return 0
-        val m = mode(c)
-        if (m == 1 && (t and 2) != 0) return 2
-        if (m == 2 && (t and 6) != 0) return 2
-        if ((t and 1) != 0) return 1
-        return 0
-    }
-
-    fun secLocked(c: Context, id: String): Boolean {
-        if (Clock.left(c, "sec_$id") > 0L) return true
-        return mode(c) >= 1 && Store.feat(c, "s_lock") && (id == "custom" || id == "pass")
-    }
-
-    fun strikeNeed(c: Context): Int {
-        val n = Store.strikeN(c)
-        return if (mode(c) == 2 && Store.feat(c, "k_strike")) minOf(n, 2) else n
-    }
-
-    private fun setGray(c: Context, on: Boolean) {
-        if (!Store.feat(c, "gray") || !canSecure(c)) return
-        try {
-            Settings.Secure.putInt(c.contentResolver, "accessibility_display_daltonizer_enabled", if (on) 1 else 0)
-            if (on) Settings.Secure.putInt(c.contentResolver, "accessibility_display_daltonizer", 0)
-        } catch (e: Exception) {
-        }
-    }
-
-    private fun pi(c: Context): PendingIntent =
-        PendingIntent.getBroadcast(
-            c, 7,
-            Intent(c, EventReceiver::class.java).setAction("com.securelock.app.END"),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    private fun passView(check: (String) -> Boolean): View {
+        window.setSoftInputMode(
+            WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         )
-
-    fun schedule(c: Context, ms: Long) {
-        try {
-            (c.getSystemService(Context.ALARM_SERVICE) as AlarmManager).setAndAllowWhileIdle(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + ms + 1000,
-                pi(c)
-            )
-        } catch (e: Exception) {
+        val root = base()
+        val et = EditText(this)
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        et.imeOptions = EditorInfo.IME_ACTION_DONE
+        et.setTextColor(UI.TXT)
+        et.setHintTextColor(UI.DIM)
+        et.hint = "Parola"
+        et.textSize = 22f
+        et.isSingleLine = true
+        val msg = UI.tv(this, " ", 15f, Color.parseColor("#E57373"))
+        et.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                val t = s?.toString() ?: ""
+                if (t.isNotEmpty() && check(t)) ok()
+            }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        et.setOnEditorActionListener { _, _, _ ->
+            if (!done) {
+                msg.text = "Yanlış"
+                et.setText("")
+            }
+            true
         }
+        root.addView(et, UI.lp(this, 0))
+        root.addView(msg, UI.lp(this, 6))
+        root.addView(UI.tv(this, "Doğru parola yazılınca otomatik açılır.", 13f, UI.DIM), UI.lp(this, 4))
+        root.addView(UI.button(this, "Ana ekran") { goHome() }, UI.lp(this, 16))
+        et.requestFocus()
+        return root
     }
 
-    fun launchers(c: Context): Set<String> {
-        val s = HashSet<String>()
-        s.add("com.sec.android.app.launcher")
-        try {
-            c.packageManager.queryIntentActivities(
-                Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0
-            ).forEach { s.add(it.activityInfo.packageName) }
-        } catch (e: Exception) {
+    private fun patternView(check: (String) -> Boolean): View {
+        val root = base()
+        root.gravity = Gravity.CENTER
+        val msg = UI.tv(this, " ", 15f, Color.parseColor("#E57373"))
+        msg.gravity = Gravity.CENTER
+        val pv = PatternView(this)
+        pv.onDone = { code ->
+            if (code.length >= 4 && check(code)) {
+                ok()
+            } else {
+                msg.text = "Yanlış"
+                pv.flashError()
+            }
         }
-        return s
-    }
-
-    // Telefonu tuğlaya çevirmemek için: bunlar asla engellenemez
-    fun protectedPkgs(c: Context): Set<String> {
-        val s = HashSet<String>(launchers(c))
-        s.addAll(
-            listOf(
-                c.packageName, "android", "com.android.systemui", "com.android.phone",
-                "com.android.server.telecom", "com.samsung.android.incallui",
-                "com.samsung.android.dialer", "com.google.android.dialer",
-                "com.android.emergency", "com.samsung.android.app.telephonyui"
-            )
-        )
-        try {
-            c.packageManager.queryIntentActivities(Intent(Intent.ACTION_DIAL, Uri.parse("tel:123")), 0)
-                .forEach { s.add(it.activityInfo.packageName) }
-            (c.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
-                .enabledInputMethodList.forEach { s.add(it.packageName) }
-        } catch (e: Exception) {
-        }
-        return s
+        root.addView(msg, LinearLayout.LayoutParams(-1, -2))
+        root.addView(pv, LinearLayout.LayoutParams(-1, -2))
+        root.addView(UI.button(this, "Ana ekran") { goHome() }, UI.lp(this, 16))
+        return root
     }
 }
