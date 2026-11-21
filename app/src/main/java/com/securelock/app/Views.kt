@@ -23,8 +23,14 @@ object UI {
     val CARD = Color.parseColor("#17171B")
     val TXT = Color.parseColor("#EDEDED")
     val DIM = Color.parseColor("#8A8A93")
-    val ACC = Color.parseColor("#2E7D32")
     val RED = Color.parseColor("#B71C1C")
+    var ACC: Int = Color.parseColor("#2E7D32")
+    val accentNames = listOf("Yeşil", "Mavi", "Mor", "Turuncu", "Kırmızı")
+    private val accents = listOf("#2E7D32", "#1565C0", "#6A1B9A", "#E65100", "#B71C1C")
+
+    fun useTheme(c: Context) {
+        ACC = Color.parseColor(accents[Store.theme(c)])
+    }
 
     fun dp(c: Context, v: Int): Int = (v * c.resources.displayMetrics.density).toInt()
 
@@ -43,6 +49,8 @@ object UI {
         if (bold) t.typeface = Typeface.DEFAULT_BOLD
         return t
     }
+
+    fun label(c: Context, s: String): TextView = tv(c, s, 13f, ACC, true)
 
     fun button(c: Context, s: String, color: Int = CARD, on: () -> Unit): Button {
         val b = Button(c)
@@ -86,6 +94,15 @@ object UI {
         l.background = round(c, CARD)
         l.setPadding(dp(c, 16), dp(c, 14), dp(c, 16), dp(c, 14))
         return l
+    }
+
+    fun rowBtn(c: Context, title: String, value: String, on: () -> Unit): LinearLayout {
+        val r = card(c)
+        r.addView(tv(c, title, 16f))
+        if (value.isNotEmpty()) r.addView(tv(c, value, 13f, DIM), lp(c, 2))
+        r.isClickable = true
+        r.setOnClickListener { on() }
+        return r
     }
 
     fun page(c: Context): Pair<ScrollView, LinearLayout> {
