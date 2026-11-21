@@ -27,7 +27,19 @@ jobs:
           path: ~/.android/debug.keystore
           key: securelock-keystore-v1
       - name: Build
-        run: gradle assembleRelease --no-daemon --stacktrace
+        run: |
+          set +e
+          gradle assembleRelease --no-daemon --console=plain > build.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "===== HATALAR ====="
+            grep -E "^e: " build.log | head -30
+            grep -E "^e: " build.log | head -10 | while IFS= read -r line; do
+              echo "::error::${line#e: file:///home/runner/work/SecureLock/SecureLock/}"
+            done
+            grep -A 6 "What went wrong" build.log | head -20
+          fi
+          exit $code
       - uses: actions/upload-artifact@v4
         with:
           name: SecureLock-APK
