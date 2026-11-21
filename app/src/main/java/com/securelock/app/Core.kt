@@ -13,7 +13,6 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.SystemClock
-import android.os.UserManager
 import android.provider.Settings
 import android.view.inputmethod.InputMethodManager
 import java.security.MessageDigest
@@ -22,6 +21,9 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
+fun norm(s: String): String =
+    s.lowercase(Locale.ROOT).replace("\u0307", "").replace('ı', 'i').trim()
+
 class AdminReceiver : DeviceAdminReceiver()
 
 class EventReceiver : BroadcastReceiver() {
@@ -29,7 +31,7 @@ class EventReceiver : BroadcastReceiver() {
         Policy.refresh(context)
         val a = intent.action
         if (a == Intent.ACTION_BOOT_COMPLETED || a == Intent.ACTION_MY_PACKAGE_REPLACED) {
-            if (Policy.mode(context) != 0) Policy.schedule(context, Policy.remaining(context))
+            if (Policy.rawMode(context) != 0) Policy.schedule(context, Policy.remaining(context))
         }
     }
 }
@@ -37,6 +39,82 @@ class EventReceiver : BroadcastReceiver() {
 class SecretReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+}
+
+object Feat {
+    val siki = listOf(
+        Triple("s_acc", "Erişilebilirlik sayfaları engelli", true),
+        Triple("s_date", "Tarih ve saat ile Genel yönetim engelli", true),
+        Triple("s_info", "Secure Lock bilgi ve kaldırma sayfaları engelli", false),
+        Triple("s_lock", "Oturumda şifreler ve özelleştirme kilitli", true),
+        Triple("s_keep", "Oturumda uygulama listesinden çıkarma yok", true)
+    )
+    val kati = listOf(
+        Triple("k_info", "Secure Lock bilgi ve kaldırma sayfaları engelli", true),
+        Triple("k_admin", "Cihaz yöneticisi sayfası engelli", true),
+        Triple("k_enter", "Katı Mod'da Secure Lock'a girilebilsin", false),
+        Triple("k_strike", "Sert ceza: en fazla 2 denemede ekran kilitlenir", true),
+        Triple("k_allset", "Ayarlar uygulaması tamamen engelli", false)
+    )
+
+    fun def(k: String): Boolean {
+        for (t in siki) if (t.first == k) return t.third
+        for (t in kati) if (t.first == k) return t.third
+        return false
+    }
+}
+
+object Clock {
+    private fun boot(c: Context): Int = try {
+        Settings.Global.getInt(c.contentResolver, Settings.Global.BOOT_COUNT, -1)
+    } catch (e: Exception) {
+        -1
+    }
+
+    fun left(c: Context, n: String): Long {
+        val sp = Store.p(c)
+        val kw = "t_${n}_w"
+        if (!sp.contains(kw)) return 0L
+        val nowE = SystemClock.elapsedRealtime()
+        var endE = sp.getLong("t_${n}_e", 0L)
+        val savedE = sp.getLong("t_${n}_s", 0L)
+        val b = boot(c)
+        val rebooted = (b != -1 && b != sp.getInt("t_${n}_b", -1)) || nowE < savedE
+        val ed = sp.edit()
+        var dirty = false
+        if (rebooted) {
+            endE = nowE + maxOf(0L, sp.getLong(kw, 0L) - System.currentTimeMillis())
+            ed.putLong("t_${n}_e", endE).putLong("t_${n}_s", nowE).putInt("t_${n}_b", b)
+            dirty = true
+        } else if (nowE - savedE > 15000L) {
+            ed.putLong("t_${n}_s", nowE)
+            dirty = true
+        }
+        val r = endE - nowE
+        if (r <= 0L) {
+            clear(c, n)
+            return 0L
+        }
+        if (dirty) ed.apply()
+        return r
+    }
+
+    fun add(c: Context, n: String, ms: Long) {
+        val total = left(c, n) + ms
+        val nowE = SystemClock.elapsedRealtime()
+        Store.p(c).edit()
+            .putLong("t_${n}_e", nowE + total)
+            .putLong("t_${n}_s", nowE)
+            .putLong("t_${n}_w", System.currentTimeMillis() + total)
+            .putInt("t_${n}_b", boot(c))
+            .apply()
+    }
+
+    fun clear(c: Context, n: String) {
+        Store.p(c).edit()
+            .remove("t_${n}_w").remove("t_${n}_e").remove("t_${n}_s").remove("t_${n}_b")
+            .apply()
     }
 }
 
@@ -76,25 +154,52 @@ object Store {
     }
     fun checkLock(c: Context, s: String) = p(c).getString("lock", null) == hash(c, s)
 
-    fun hasAppPass(c: Context, pkg: String) = p(c).contains("ap_$pkg")
-    fun setAppPass(c: Context, pkg: String, s: String) {
-        val e = p(c).edit()
-        if (s.isEmpty()) e.remove("ap_$pkg") else e.putString("ap_$pkg", hash(c, s))
-        e.apply()
+    fun hasAppLock(c: Context, pkg: String) = p(c).contains("ap_$pkg")
+    fun appType(c: Context, pkg: String) = p(c).getInt("apt_$pkg", PASS)
+    fun setAppLock(c: Context, pkg: String, type: Int, s: String) {
+        p(c).edit().putString("ap_$pkg", hash(c, s)).putInt("apt_$pkg", type).putInt("apl_$pkg", s.length).apply()
     }
-    fun checkAppPass(c: Context, pkg: String, s: String) = p(c).getString("ap_$pkg", null) == hash(c, s)
+    fun clearAppLock(c: Context, pkg: String) {
+        p(c).edit().remove("ap_$pkg").remove("apt_$pkg").remove("apl_$pkg").apply()
+    }
+    fun typeFor(c: Context, pkg: String) = if (hasAppLock(c, pkg)) appType(c, pkg) else lockType(c)
+    fun lenFor(c: Context, pkg: String) = if (hasAppLock(c, pkg)) p(c).getInt("apl_$pkg", 4) else pinLen(c)
+    fun checkFor(c: Context, pkg: String, s: String) =
+        if (hasAppLock(c, pkg)) p(c).getString("ap_$pkg", null) == hash(c, s) else checkLock(c, s)
 
     fun blocked(c: Context): Set<String> =
         HashSet<String>(p(c).getStringSet("blocked", emptySet()) ?: emptySet<String>())
 
-    fun setBlocked(c: Context, pkg: String, on: Boolean) {
-        val s = HashSet<String>(blocked(c))
-        if (on) s.add(pkg) else s.remove(pkg)
-        p(c).edit().putStringSet("blocked", s).apply()
+    // 1 = Normal kilit, 2 = Sıkı Mod'da engelle, 4 = Katı Mod'da engelle
+    fun tags(c: Context, pkg: String): Int {
+        val s = p(c).getStringSet("blocked", null) ?: return 0
+        if (!s.contains(pkg)) return 0
+        return p(c).getInt("tag_$pkg", 7)
     }
 
-    fun flag(c: Context, k: String) = p(c).getBoolean("f_$k", false)
-    fun setFlag(c: Context, k: String, v: Boolean) { p(c).edit().putBoolean("f_$k", v).apply() }
+    fun setTags(c: Context, pkg: String, t: Int) {
+        val s = HashSet<String>(blocked(c))
+        val e = p(c).edit()
+        if (t == 0) {
+            s.remove(pkg)
+            e.remove("tag_$pkg")
+        } else {
+            s.add(pkg)
+            e.putInt("tag_$pkg", t)
+        }
+        e.putStringSet("blocked", s).apply()
+    }
+
+    fun feat(c: Context, k: String) = p(c).getBoolean("f_$k", Feat.def(k))
+    fun setFeat(c: Context, k: String, v: Boolean) { p(c).edit().putBoolean("f_$k", v).apply() }
+    fun setInt(c: Context, k: String, v: Int) { p(c).edit().putInt(k, v).apply() }
+    fun setStr(c: Context, k: String, v: String) { p(c).edit().putString(k, v).apply() }
+
+    fun theme(c: Context) = p(c).getInt("theme", 0).coerceIn(0, 4)
+    fun ghostSecs(c: Context) = p(c).getInt("gsec", 3)
+    fun ghostMsg(c: Context): String = p(c).getString("gmsg", "Hayır.") ?: "Hayır."
+    fun strikeN(c: Context) = p(c).getInt("strike", 3)
+    fun relock(c: Context) = p(c).getInt("relock", 0)
 
     private fun cal(off: Int): Calendar {
         val c = Calendar.getInstance()
@@ -125,13 +230,18 @@ object Store {
 object Policy {
     fun admin(c: Context) = ComponentName(c, AdminReceiver::class.java)
     fun dpm(c: Context) = c.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-    fun isOwner(c: Context) = dpm(c).isDeviceOwnerApp(c.packageName)
+    fun adminActive(c: Context): Boolean = try {
+        dpm(c).isAdminActive(admin(c))
+    } catch (e: Exception) {
+        false
+    }
     fun canSecure(c: Context) =
         c.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED
 
     fun rawMode(c: Context) = Store.p(c).getInt("s_mode", 0)
 
     fun mode(c: Context): Int {
+        if (rawMode(c) == 0) return 0
         refresh(c)
         return rawMode(c)
     }
@@ -140,69 +250,52 @@ object Policy {
         if (rawMode(c) != 0 && remaining(c) <= 0L) end(c)
     }
 
-    fun remaining(c: Context): Long {
-        if (rawMode(c) == 0) return 0L
-        val sp = Store.p(c)
-        val nowE = SystemClock.elapsedRealtime()
-        var endE = sp.getLong("s_end_e", 0L)
-        if (nowE < sp.getLong("s_saved_e", 0L)) {
-            endE = nowE + maxOf(0L, sp.getLong("s_end_w", 0L) - System.currentTimeMillis())
-            sp.edit().putLong("s_end_e", endE).apply()
-        }
-        sp.edit().putLong("s_saved_e", nowE).apply()
-        return maxOf(0L, endE - nowE)
-    }
+    fun remaining(c: Context): Long = Clock.left(c, "sess")
 
-    fun start(c: Context, mode: Int, minutes: Int) {
-        val nowE = SystemClock.elapsedRealtime()
-        val ms = minutes * 60000L
-        Store.p(c).edit()
-            .putInt("s_mode", mode)
-            .putInt("s_min", minutes)
-            .putLong("s_end_e", nowE + ms)
-            .putLong("s_saved_e", nowE)
-            .putLong("s_end_w", System.currentTimeMillis() + ms)
-            .apply()
+    fun start(c: Context, mode: Int, ms: Long) {
+        Store.p(c).edit().putInt("s_mode", mode).putLong("s_ms", ms).apply()
+        Clock.clear(c, "sess")
+        Clock.add(c, "sess", ms)
         setGray(c, true)
-        if (mode == 2) strict(c, true)
         schedule(c, ms)
     }
 
     fun end(c: Context) {
-        val mode = rawMode(c)
-        if (mode == 0) return
-        val min = Store.p(c).getInt("s_min", 0)
+        if (rawMode(c) == 0) return
+        val min = (Store.p(c).getLong("s_ms", 0L) / 60000L).toInt()
         Store.p(c).edit().putInt("s_mode", 0).apply()
-        if (mode == 2) strict(c, false)
+        Clock.clear(c, "sess")
         setGray(c, false)
-        Store.addFocus(c, min)
+        Store.addFocus(c, minOf(min, 1440))
         try {
             (c.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(pi(c))
         } catch (e: Exception) {
         }
     }
 
-    private fun strict(c: Context, on: Boolean) {
-        if (!isOwner(c)) return
-        try {
-            val d = dpm(c)
-            val a = admin(c)
-            d.setUninstallBlocked(a, c.packageName, on)
-            d.setUserControlDisabledPackages(a, if (on) listOf(c.packageName) else emptyList<String>())
-            val rs = listOf(
-                UserManager.DISALLOW_SAFE_BOOT,
-                UserManager.DISALLOW_FACTORY_RESET,
-                UserManager.DISALLOW_CONFIG_DATE_TIME
-            )
-            for (r in rs) {
-                if (on) d.addUserRestriction(a, r) else d.clearUserRestriction(a, r)
-            }
-        } catch (e: Exception) {
-        }
+    // 0 = serbest, 1 = şifre kapısı, 2 = Hayalet Mod (kesin engel)
+    fun action(c: Context, pkg: String): Int {
+        val t = Store.tags(c, pkg)
+        if (t == 0) return 0
+        val m = mode(c)
+        if (m == 1 && (t and 2) != 0) return 2
+        if (m == 2 && (t and 6) != 0) return 2
+        if ((t and 1) != 0) return 1
+        return 0
+    }
+
+    fun secLocked(c: Context, id: String): Boolean {
+        if (Clock.left(c, "sec_$id") > 0L) return true
+        return mode(c) >= 1 && Store.feat(c, "s_lock") && (id == "custom" || id == "pass")
+    }
+
+    fun strikeNeed(c: Context): Int {
+        val n = Store.strikeN(c)
+        return if (mode(c) == 2 && Store.feat(c, "k_strike")) minOf(n, 2) else n
     }
 
     private fun setGray(c: Context, on: Boolean) {
-        if (!Store.flag(c, "gray") || !canSecure(c)) return
+        if (!Store.feat(c, "gray") || !canSecure(c)) return
         try {
             Settings.Secure.putInt(c.contentResolver, "accessibility_display_daltonizer_enabled", if (on) 1 else 0)
             if (on) Settings.Secure.putInt(c.contentResolver, "accessibility_display_daltonizer", 0)
