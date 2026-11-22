@@ -10,6 +10,8 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -23,14 +25,8 @@ class GuardService : AccessibilityService() {
 
     companion object {
         var inst: GuardService? = null
-        private val ACC_T = listOf("erişilebilirlik", "accessibility").map { norm(it) }
-        private val DATE_T = listOf(
-            "tarih ve saat", "date and time", "date & time", "genel yönetim", "general management"
-        ).map { norm(it) }
-        private val ADMIN_T = listOf(
-            "cihaz yöneticisi uygulamaları", "cihaz yönetimi uygulamaları",
-            "cihaz yönetim uygulamaları", "cihaz yönetici uygulamaları",
-            "device admin apps", "device administrators"
+        private val INFO_W = listOf(
+            "kaldır", "zorla durdur", "uninstall", "force stop", "devre dışı bırak", "disable"
         ).map { norm(it) }
     }
 
@@ -39,6 +35,7 @@ class GuardService : AccessibilityService() {
     private var cover: FrameLayout? = null
     private var coverMsg: TextView? = null
     private var coverNum: TextView? = null
+    private var coverSub: TextView? = null
     private var busy = false
     private var current = ""
     private var lastLock = 0L
@@ -91,15 +88,22 @@ class GuardService : AccessibilityService() {
 
     fun markUnlocked(p: String) {
         unlockAt[p] = System.currentTimeMillis()
-        current = p
+        if (!p.startsWith("pg:")) current = p
     }
 
-    private fun isUnlocked(pkg: String): Boolean {
-        val t = unlockAt[pkg] ?: return false
+    private fun clearPages() {
+        val iter = unlockAt.keys.iterator()
+        while (iter.hasNext()) {
+            if (iter.next().startsWith("pg:")) iter.remove()
+        }
+    }
+
+    private fun isUnlocked(key: String): Boolean {
+        val t = unlockAt[key] ?: return false
         val rl = Store.relock(this)
         if (rl > 0) {
             if (System.currentTimeMillis() - t < rl * 60000L) return true
-            unlockAt.remove(pkg)
+            unlockAt.remove(key)
             return false
         }
         return true
@@ -116,13 +120,22 @@ class GuardService : AccessibilityService() {
 
     private fun guardable(pkg: String) = pkg.contains("settings") || pkg.contains("packageinstaller")
 
+    private fun watching(): Boolean =
+        Policy.rawMode(this) != 0 || Store.feat(this, "p_info") || Store.feat(this, "p_uninst") ||
+            Store.blocked(this).any { it.startsWith("pg:") }
+
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         if (e == null) return
         val type = e.eventType
+        val pkg = e.packageName?.toString() ?: return
+
+        if (type == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+            longClick(e, pkg)
+            return
+        }
         if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
-        val pkg = e.packageName?.toString() ?: return
 
         if (pkg == packageName) {
             if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
@@ -135,7 +148,7 @@ class GuardService : AccessibilityService() {
         }
 
         if (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            if (busy || Policy.rawMode(this) == 0 || !guardable(pkg)) return
+            if (busy || !guardable(pkg) || !watching()) return
             val now = System.currentTimeMillis()
             if (now - lastScan > 250) {
                 lastScan = now
@@ -152,49 +165,90 @@ class GuardService : AccessibilityService() {
         }
         if (protSet.contains(pkg)) return
         if (pkg != current) {
-            if (Store.relock(this) == 0) unlockAt.remove(current)
+            if (Store.relock(this) == 0) {
+                unlockAt.remove(current)
+                if (current.contains("settings")) clearPages()
+            }
             current = pkg
         }
-        val mode = Policy.mode(this)
-        if (mode != 0 && guardable(pkg)) {
+        if (guardable(pkg) && watching()) {
             if (pageGuard(pkg)) return
             h.postDelayed({ recheck(pkg) }, 400)
+            h.postDelayed({ recheck(pkg) }, 1200)
         }
         val act = Policy.action(this, pkg)
         if (act == 2) ghost(pkg) else if (act == 1 && !isUnlocked(pkg)) lockApp(pkg)
     }
 
+    // Ana ekranda Secure Lock simgesine basılı tutulursa Kaldır menüsü yerine blok ekranı
+    private fun longClick(e: AccessibilityEvent, pkg: String) {
+        if (busy || !Store.feat(this, "p_launch") || Policy.uninstallOpen(this)) return
+        cache()
+        if (!launchSet.contains(pkg)) return
+        val sb = StringBuilder()
+        try {
+            for (t in e.text) sb.append(t).append(' ')
+            val cd = e.contentDescription
+            if (cd != null) sb.append(cd).append(' ')
+            val s = e.source
+            if (s != null) {
+                val st = s.text
+                if (st != null) sb.append(st).append(' ')
+                val sc = s.contentDescription
+                if (sc != null) sb.append(sc)
+            }
+        } catch (x: Exception) {
+        }
+        if (norm(sb.toString()).contains("secure lock")) kick("Kaldırma engelli")
+    }
+
     private fun recheck(pkg: String) {
-        if (!busy && current == pkg && Policy.mode(this) != 0) pageGuard(pkg)
+        if (!busy && current == pkg && watching()) pageGuard(pkg)
     }
 
     // Ayarlar sayfalarını başlıklarından tanıyıp içeri sokmaz
     private fun pageGuard(pkg: String): Boolean {
         val mode = Policy.mode(this)
-        if (mode == 0) return false
         if (mode == 2 && Store.feat(this, "k_allset") && pkg == "com.android.settings") {
             kick("Ayarlar kilitli")
             return true
         }
         val t = pageTexts(pkg)
         if (t.isEmpty()) return false
-        val head = t.take(8)
-        val ours = t.any { it.contains("secure lock") }
-        var hit = ""
-        if (Store.feat(this, "s_acc") && head.any { ACC_T.contains(it) }) hit = "Erişilebilirlik kilitli"
-        if (hit.isEmpty() && Store.feat(this, "s_date") && head.any { DATE_T.contains(it) }) hit = "Tarih ve saat kilitli"
-        if (hit.isEmpty() && mode == 2 && Store.feat(this, "k_admin") && head.any { ADMIN_T.contains(it) }) {
-            hit = "Cihaz yöneticisi kilitli"
+        val open = Policy.uninstallOpen(this)
+
+        if (pkg.contains("packageinstaller")) {
+            if (!open && Store.feat(this, "p_uninst") && t.any { it.contains("secure lock") }) {
+                kick("Kaldırma engelli")
+                return true
+            }
+            return false
         }
-        if (hit.isEmpty() && ours) {
-            val info = (mode == 2 && Store.feat(this, "k_info")) || Store.feat(this, "s_info")
-            val acc = Store.feat(this, "s_acc") &&
-                t.any { it.contains("erişilebilirlik") || it.contains("accessibility") }
-            if (info || acc) hit = "Secure Lock korumalı"
+
+        if (t.take(12).any { it == "secure lock" }) {
+            val info = t.any { INFO_W.contains(it) }
+            if (!open && (mode != 0 || (info && Store.feat(this, "p_info")))) {
+                kick("Secure Lock korumalı")
+                return true
+            }
         }
-        if (hit.isEmpty()) return false
-        kick(hit)
-        return true
+
+        val head = t.take(5)
+        if (head.take(2).any { it == "ayarlar" || it == "settings" }) return false
+        for (pg in Pages.all) {
+            if (head.none { pg.t.contains(it) }) continue
+            val key = "pg:" + pg.id
+            val a = Policy.pageAction(this, pg.id)
+            if (a == 2) {
+                kick(pg.name + " kilitli")
+                return true
+            }
+            if (a == 1 && !isUnlocked(key)) {
+                lockApp(key)
+                return true
+            }
+        }
+        return false
     }
 
     private fun pageTexts(pkg: String): List<String> {
@@ -209,12 +263,21 @@ class GuardService : AccessibilityService() {
     }
 
     private fun collect(n: AccessibilityNodeInfo?, out: ArrayList<String>, d: Int) {
-        if (n == null || out.size >= 90 || d > 30) return
+        if (n == null || out.size >= 140 || d > 30) return
         val t = n.text
         if (t != null && t.isNotEmpty()) out.add(norm(t.toString()))
         val cd = n.contentDescription
         if (cd != null && cd.isNotEmpty()) out.add(norm(cd.toString()))
         for (i in 0 until n.childCount) collect(n.getChild(i), out, d + 1)
+    }
+
+    private fun buzz() {
+        if (!Store.feat(this, "vib")) return
+        try {
+            val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            v.vibrate(VibrationEffect.createOneShot(250, VibrationEffect.DEFAULT_AMPLITUDE))
+        } catch (e: Exception) {
+        }
     }
 
     private fun kick(msg: String) {
@@ -223,7 +286,8 @@ class GuardService : AccessibilityService() {
         if (now - lastKick < 800) return
         lastKick = now
         Store.addAttempt(this)
-        showCover(msg, "")
+        buzz()
+        showCover(msg, "", Store.randomLine(this))
         performGlobalAction(GLOBAL_ACTION_HOME)
         h.postDelayed({ if (!busy) hideCover() }, 1200)
     }
@@ -234,18 +298,20 @@ class GuardService : AccessibilityService() {
         busy = true
         val now = System.currentTimeMillis()
         Store.addAttempt(this)
+        buzz()
         strikes.add(now)
         strikes.removeAll { now - it > 120000 }
         val strike = strikes.size >= Policy.strikeNeed(this)
         if (strike) strikes.clear()
         val n = Store.ghostSecs(this)
         val msg = Store.ghostMsg(this)
-        showCover(msg, n.toString())
+        val sub = Store.randomLine(this)
+        showCover(msg, n.toString(), sub)
         performGlobalAction(GLOBAL_ACTION_HOME)
         h.postDelayed({ kill(pkg) }, 400)
         for (i in 1 until n) {
             val left = n - i
-            h.postDelayed({ setCover(msg, left.toString()); kill(pkg) }, i * 1000L)
+            h.postDelayed({ setCover(msg, left.toString(), sub); kill(pkg) }, i * 1000L)
         }
         h.postDelayed({
             kill(pkg)
@@ -260,7 +326,7 @@ class GuardService : AccessibilityService() {
         val now = System.currentTimeMillis()
         if (now - lastLock < 700) return
         lastLock = now
-        showCover("", "")
+        showCover("", "", "")
         val i = Intent(this, LockActivity::class.java)
             .putExtra("pkg", pkg)
             .addFlags(
@@ -287,15 +353,17 @@ class GuardService : AccessibilityService() {
         }
     }
 
-    private fun showCover(msg: String, num: String) {
+    private fun showCover(msg: String, num: String, sub: String) {
         val w = wm ?: return
         if (cover == null) {
             val mp = ViewGroup.LayoutParams.MATCH_PARENT
             val fl = FrameLayout(this)
-            fl.setBackgroundColor(Color.BLACK)
+            fl.setBackgroundColor(Store.coverColor(this))
             val col = LinearLayout(this)
             col.orientation = LinearLayout.VERTICAL
             col.gravity = Gravity.CENTER
+            val pad = UI.dp(this, 28)
+            col.setPadding(pad, pad, pad, pad)
             val tm = TextView(this)
             tm.setTextColor(Color.WHITE)
             tm.textSize = 24f
@@ -304,8 +372,13 @@ class GuardService : AccessibilityService() {
             tn.setTextColor(Color.WHITE)
             tn.textSize = 72f
             tn.gravity = Gravity.CENTER
+            val ts = TextView(this)
+            ts.setTextColor(Color.parseColor("#BBBBBB"))
+            ts.textSize = 17f
+            ts.gravity = Gravity.CENTER
             col.addView(tm, LinearLayout.LayoutParams(-2, -2))
             col.addView(tn, LinearLayout.LayoutParams(-2, -2))
+            col.addView(ts, LinearLayout.LayoutParams(-2, -2))
             fl.addView(col, FrameLayout.LayoutParams(mp, mp))
             val lp = WindowManager.LayoutParams(
                 mp, mp,
@@ -321,15 +394,17 @@ class GuardService : AccessibilityService() {
                 cover = fl
                 coverMsg = tm
                 coverNum = tn
+                coverSub = ts
             } catch (e: Exception) {
             }
         }
-        setCover(msg, num)
+        setCover(msg, num, sub)
     }
 
-    private fun setCover(msg: String, num: String) {
+    private fun setCover(msg: String, num: String, sub: String) {
         coverMsg?.text = msg
         coverNum?.text = num
+        coverSub?.text = sub
     }
 
     private fun hideCover() {
@@ -341,5 +416,6 @@ class GuardService : AccessibilityService() {
         cover = null
         coverMsg = null
         coverNum = null
+        coverSub = null
     }
 }
