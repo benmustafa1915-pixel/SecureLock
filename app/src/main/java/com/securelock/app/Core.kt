@@ -25,6 +25,16 @@ import java.util.Locale
 fun norm(s: String): String =
     s.lowercase(Locale.ROOT).replace("\u0307", "").replace('ı', 'i').trim()
 
+fun fmtLeft(ms: Long): String {
+    val s = maxOf(0L, ms) / 1000
+    val d = s / 86400
+    val rest = String.format(Locale.US, "%d:%02d:%02d", s % 86400 / 3600, s % 3600 / 60, s % 60)
+    return if (d > 0) "$d gün $rest" else rest
+}
+
+// kind: 0 serbest, 1 şifre kapısı, 2 Sıkı engel, 3 Katı engel; left: engelin bitmesine kalan süre
+class Blk(val kind: Int, val left: Long)
+
 class AdminReceiver : DeviceAdminReceiver()
 
 class EventReceiver : BroadcastReceiver() {
@@ -84,7 +94,7 @@ object Pages {
             "admin", "Cihaz yöneticisi uygulamaları",
             listOf(
                 "cihaz yöneticisi uygulamaları", "cihaz yönetim uygulamaları",
-                "cihaz yönetici uygulamaları", "device admin apps", "device admin apps"
+                "cihaz yönetici uygulamaları", "device admin apps"
             )
         ),
         Pg("apps", "Uygulamalar", listOf("uygulamalar", "apps")),
@@ -213,8 +223,8 @@ object Store {
     fun blocked(c: Context): Set<String> =
         HashSet<String>(p(c).getStringSet("blocked", emptySet()) ?: emptySet<String>())
 
-    // 1 = Normal kilit, 2 = Sıkı Mod'da engelle, 4 = Katı Mod'da engelle
-    // Anahtar bir uygulama paketi ya da "pg:..." ile başlayan telefon ayar sayfası olabilir
+    // 1 = Normal kilit, 2 = Sıkı oturuma dahil, 4 = Katı oturuma dahil
+    // Anahtar: uygulama paketi, "pg:..." (telefon ayar sayfası) ya da "ui:..." (uygulama içi öğe)
     fun tags(c: Context, pkg: String): Int {
         val s = p(c).getStringSet("blocked", null) ?: return 0
         if (!s.contains(pkg)) return 0
@@ -234,6 +244,12 @@ object Store {
         e.putStringSet("blocked", s).apply()
     }
 
+    // Öğeye özel zamanlayıcılar: "is_<anahtar>" Sıkı, "ik_<anahtar>" Katı
+    fun timerLeft(c: Context, key: String): Long =
+        maxOf(Clock.left(c, "is_$key"), Clock.left(c, "ik_$key"))
+
+    fun lockedNow(c: Context, key: String): Boolean = tags(c, key) != 0 || timerLeft(c, key) > 0L
+
     fun feat(c: Context, k: String) = p(c).getBoolean("f_$k", Feat.def(k))
     fun setFeat(c: Context, k: String, v: Boolean) { p(c).edit().putBoolean("f_$k", v).apply() }
     fun setInt(c: Context, k: String, v: Int) { p(c).edit().putInt(k, v).apply() }
@@ -245,6 +261,8 @@ object Store {
     fun strikeN(c: Context) = p(c).getInt("strike", 3)
     fun relock(c: Context) = p(c).getInt("relock", 0)
     fun uninMin(c: Context) = p(c).getInt("unin_min", 10)
+    fun ssec(c: Context) = p(c).getInt("ssec", 4)
+    fun backN(c: Context) = p(c).getInt("backn", 4)
     fun cover(c: Context) = p(c).getInt("cover", 0).coerceIn(0, 3)
     fun coverColor(c: Context): Int = Color.parseColor(coverHex[cover(c)])
 
@@ -333,24 +351,46 @@ object Policy {
     // Kaldırma izni penceresi: sadece oturum yokken ve süre içinde açıktır
     fun uninstallOpen(c: Context): Boolean = mode(c) == 0 && Clock.left(c, "unin") > 0L
 
-    // 0 = serbest, 1 = şifre kapısı, 2 = Hayalet Mod (kesin engel)
-    fun action(c: Context, pkg: String): Int {
-        val t = Store.tags(c, pkg)
-        if (t == 0) return 0
+    // Bir öğenin (uygulama, ayar sayfası ya da uygulama içi düğme) şu anki durumu
+    fun blockInfo(c: Context, key: String): Blk {
+        val kk = Clock.left(c, "ik_$key")
+        val ks = Clock.left(c, "is_$key")
+        val t = Store.tags(c, key)
         val m = mode(c)
-        if (m == 1 && (t and 2) != 0) return 2
-        if (m == 2 && (t and 6) != 0) return 2
-        if ((t and 1) != 0) return 1
-        return 0
+        val rem = if (m != 0) remaining(c) else 0L
+        var kind = 0
+        var left = 0L
+        if (kk > 0L) {
+            kind = 3
+            left = maxOf(left, kk)
+        }
+        if (m == 2 && (t and 6) != 0) {
+            kind = 3
+            left = maxOf(left, rem)
+        }
+        if (ks > 0L) {
+            if (kind < 2) kind = 2
+            left = maxOf(left, ks)
+        }
+        if (m == 1 && (t and 2) != 0) {
+            if (kind < 2) kind = 2
+            left = maxOf(left, rem)
+        }
+        if (kind == 0 && (t and 1) != 0) kind = 1
+        return Blk(kind, left)
     }
 
-    // Telefon ayar sayfaları için karar: hazır oturum kuralları + sayfaya konan modlar
-    fun pageAction(c: Context, id: String): Int {
+    // Telefon ayar sayfaları: hazır oturum kuralları + sayfaya konan modlar
+    fun pageInfo(c: Context, id: String): Blk {
+        val b = blockInfo(c, "pg:$id")
         val m = mode(c)
-        if (m >= 1 && Store.feat(c, "s_acc") && id == "acc") return 2
-        if (m >= 1 && Store.feat(c, "s_date") && (id == "date" || id == "gm")) return 2
-        if (m == 2 && Store.feat(c, "k_admin") && id == "admin") return 2
-        return action(c, "pg:$id")
+        var forced = false
+        if (m >= 1 && Store.feat(c, "s_acc") && id == "acc") forced = true
+        if (m >= 1 && Store.feat(c, "s_date") && (id == "date" || id == "gm")) forced = true
+        if (m == 2 && Store.feat(c, "k_admin") && id == "admin") forced = true
+        if (!forced) return b
+        val kind = if (m == 2) 3 else 2
+        return Blk(maxOf(kind, b.kind), maxOf(b.left, remaining(c)))
     }
 
     fun secLocked(c: Context, id: String): Boolean {
@@ -358,9 +398,9 @@ object Policy {
         return mode(c) >= 1 && Store.feat(c, "s_lock") && (id == "custom" || id == "pass")
     }
 
-    fun strikeNeed(c: Context): Int {
+    fun strikeNeed(c: Context, kind: Int): Int {
         val n = Store.strikeN(c)
-        return if (mode(c) == 2 && Store.feat(c, "k_strike")) minOf(n, 2) else n
+        return if (kind == 3 && Store.feat(c, "k_strike")) minOf(n, 2) else n
     }
 
     private fun setGray(c: Context, on: Boolean) {
