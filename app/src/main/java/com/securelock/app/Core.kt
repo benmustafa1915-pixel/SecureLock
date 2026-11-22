@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.Settings
@@ -46,23 +47,62 @@ object Feat {
     val siki = listOf(
         Triple("s_acc", "Erişilebilirlik sayfaları engelli", true),
         Triple("s_date", "Tarih ve saat ile Genel yönetim engelli", true),
-        Triple("s_info", "Secure Lock bilgi ve kaldırma sayfaları engelli", false),
         Triple("s_lock", "Oturumda şifreler ve özelleştirme kilitli", true),
-        Triple("s_keep", "Oturumda uygulama listesinden çıkarma yok", true)
+        Triple("s_keep", "Oturumda listeden çıkarma yok", true)
     )
     val kati = listOf(
-        Triple("k_info", "Secure Lock bilgi ve kaldırma sayfaları engelli", true),
         Triple("k_admin", "Cihaz yöneticisi sayfası engelli", true),
         Triple("k_enter", "Katı Mod'da Secure Lock'a girilebilsin", false),
         Triple("k_strike", "Sert ceza: en fazla 2 denemede ekran kilitlenir", true),
         Triple("k_allset", "Ayarlar uygulaması tamamen engelli", false)
     )
+    val prot = listOf(
+        Triple("p_info", "Ayarlar'da Secure Lock bilgi sayfası engelli (Kaldır görünmez)", true),
+        Triple("p_uninst", "Kaldırma penceresi engelli", true),
+        Triple("p_launch", "Ana ekranda simgeye basılı tutunca blok ekranı", true)
+    )
 
     fun def(k: String): Boolean {
         for (t in siki) if (t.first == k) return t.third
         for (t in kati) if (t.first == k) return t.third
+        for (t in prot) if (t.first == k) return t.third
         return false
     }
+}
+
+// Telefonun kendi ayar sayfaları: başlığından tanınır, uygulamalar gibi modlara bağlanır
+object Pages {
+    class Pg(val id: String, val name: String, tokens: List<String>) {
+        val t: List<String> = tokens.map { norm(it) }
+    }
+
+    val all: List<Pg> = listOf(
+        Pg("acc", "Erişilebilirlik", listOf("erişilebilirlik", "accessibility")),
+        Pg("gm", "Genel yönetim", listOf("genel yönetim", "general management")),
+        Pg("date", "Tarih ve saat", listOf("tarih ve saat", "date and time", "date & time")),
+        Pg(
+            "admin", "Cihaz yöneticisi uygulamaları",
+            listOf(
+                "cihaz yöneticisi uygulamaları", "cihaz yönetim uygulamaları",
+                "cihaz yönetici uygulamaları", "device admin apps", "device admin apps"
+            )
+        ),
+        Pg("apps", "Uygulamalar", listOf("uygulamalar", "apps")),
+        Pg("sec", "Güvenlik ve gizlilik", listOf("güvenlik ve gizlilik", "security and privacy", "güvenlik", "security")),
+        Pg("dev", "Geliştirici seçenekleri", listOf("geliştirici seçenekleri", "developer options")),
+        Pg("conn", "Bağlantılar", listOf("bağlantılar", "connections")),
+        Pg("wifi", "Wi-Fi", listOf("wi-fi", "wifi")),
+        Pg("bt", "Bluetooth", listOf("bluetooth")),
+        Pg("batt", "Pil ve cihaz bakımı", listOf("pil ve cihaz bakımı", "battery and device care", "pil", "battery")),
+        Pg("acct", "Hesaplar ve yedekleme", listOf("hesaplar ve yedekleme", "accounts and backup", "hesaplar", "accounts")),
+        Pg("upd", "Yazılım güncelleme", listOf("yazılım güncelleme", "software update")),
+        Pg("disp", "Ekran", listOf("ekran", "display")),
+        Pg("sound", "Sesler ve titreşim", listOf("sesler ve titreşim", "sounds and vibration")),
+        Pg("notif", "Bildirimler", listOf("bildirimler", "notifications")),
+        Pg("priv", "Gizlilik", listOf("gizlilik", "privacy")),
+        Pg("about", "Telefon hakkında", listOf("telefon hakkında", "about phone")),
+        Pg("vpn", "VPN", listOf("vpn"))
+    )
 }
 
 object Clock {
@@ -123,6 +163,9 @@ object Store {
     const val PASS = 1
     const val PATTERN = 2
 
+    val coverNames = listOf("Siyah", "Koyu kırmızı", "Koyu mavi", "Koyu yeşil")
+    private val coverHex = listOf("#000000", "#3B0A0A", "#0A1A3B", "#0A2E14")
+
     fun p(c: Context): SharedPreferences =
         c.applicationContext.getSharedPreferences("sl", Context.MODE_PRIVATE)
 
@@ -171,6 +214,7 @@ object Store {
         HashSet<String>(p(c).getStringSet("blocked", emptySet()) ?: emptySet<String>())
 
     // 1 = Normal kilit, 2 = Sıkı Mod'da engelle, 4 = Katı Mod'da engelle
+    // Anahtar bir uygulama paketi ya da "pg:..." ile başlayan telefon ayar sayfası olabilir
     fun tags(c: Context, pkg: String): Int {
         val s = p(c).getStringSet("blocked", null) ?: return 0
         if (!s.contains(pkg)) return 0
@@ -200,6 +244,18 @@ object Store {
     fun ghostMsg(c: Context): String = p(c).getString("gmsg", "Hayır.") ?: "Hayır."
     fun strikeN(c: Context) = p(c).getInt("strike", 3)
     fun relock(c: Context) = p(c).getInt("relock", 0)
+    fun uninMin(c: Context) = p(c).getInt("unin_min", 10)
+    fun cover(c: Context) = p(c).getInt("cover", 0).coerceIn(0, 3)
+    fun coverColor(c: Context): Int = Color.parseColor(coverHex[cover(c)])
+
+    fun pool(c: Context): List<String> =
+        (p(c).getString("pool", "") ?: "").split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+
+    fun randomLine(c: Context): String {
+        val l = pool(c)
+        if (l.isEmpty()) return ""
+        return l[SecureRandom().nextInt(l.size)]
+    }
 
     private fun cal(off: Int): Calendar {
         val c = Calendar.getInstance()
@@ -253,6 +309,7 @@ object Policy {
     fun remaining(c: Context): Long = Clock.left(c, "sess")
 
     fun start(c: Context, mode: Int, ms: Long) {
+        Clock.clear(c, "unin")
         Store.p(c).edit().putInt("s_mode", mode).putLong("s_ms", ms).apply()
         Clock.clear(c, "sess")
         Clock.add(c, "sess", ms)
@@ -273,6 +330,9 @@ object Policy {
         }
     }
 
+    // Kaldırma izni penceresi: sadece oturum yokken ve süre içinde açıktır
+    fun uninstallOpen(c: Context): Boolean = mode(c) == 0 && Clock.left(c, "unin") > 0L
+
     // 0 = serbest, 1 = şifre kapısı, 2 = Hayalet Mod (kesin engel)
     fun action(c: Context, pkg: String): Int {
         val t = Store.tags(c, pkg)
@@ -282,6 +342,15 @@ object Policy {
         if (m == 2 && (t and 6) != 0) return 2
         if ((t and 1) != 0) return 1
         return 0
+    }
+
+    // Telefon ayar sayfaları için karar: hazır oturum kuralları + sayfaya konan modlar
+    fun pageAction(c: Context, id: String): Int {
+        val m = mode(c)
+        if (m >= 1 && Store.feat(c, "s_acc") && id == "acc") return 2
+        if (m >= 1 && Store.feat(c, "s_date") && (id == "date" || id == "gm")) return 2
+        if (m == 2 && Store.feat(c, "k_admin") && id == "admin") return 2
+        return action(c, "pg:$id")
     }
 
     fun secLocked(c: Context, id: String): Boolean {
