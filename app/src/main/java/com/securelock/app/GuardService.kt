@@ -24,6 +24,8 @@ import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
+import java.util.Locale
 
 class GuardService : AccessibilityService() {
 
@@ -31,6 +33,9 @@ class GuardService : AccessibilityService() {
         var inst: GuardService? = null
         private val INFO_W = listOf(
             "kaldır", "zorla durdur", "uninstall", "force stop", "devre dışı bırak", "disable"
+        ).map { norm(it) }
+        private val ADMIN_W = listOf(
+            "cihaz yönet", "device admin", "devre dışı bırak ve kaldır", "deactivate"
         ).map { norm(it) }
     }
 
@@ -47,9 +52,13 @@ class GuardService : AccessibilityService() {
     private var lastKick = 0L
     private var lastScan = 0L
     private var lastEnforce = 0L
+    private var lastSec = 0L
     private var cacheAt = 0L
+    private var secAt = 0L
+    private var dumpPending = false
     private var protSet: Set<String> = emptySet()
     private var launchSet: Set<String> = emptySet()
+    private var secCache: List<Sections.Sec> = emptyList()
     private var registered = false
     private val unlockAt = HashMap<String, Long>()
     private val strikes = ArrayList<Long>()
@@ -94,13 +103,13 @@ class GuardService : AccessibilityService() {
 
     fun markUnlocked(p: String) {
         unlockAt[p] = System.currentTimeMillis()
-        if (!p.startsWith("pg:")) current = p
+        if (!p.startsWith("pg:") && !p.startsWith("sc:")) current = p
     }
 
-    private fun clearPages() {
+    private fun clearPrefix(pre: String) {
         val iter = unlockAt.keys.iterator()
         while (iter.hasNext()) {
-            if (iter.next().startsWith("pg:")) iter.remove()
+            if (iter.next().startsWith(pre)) iter.remove()
         }
     }
 
@@ -124,12 +133,22 @@ class GuardService : AccessibilityService() {
         }
     }
 
+    private fun sections(): List<Sections.Sec> {
+        val n = System.currentTimeMillis()
+        if (n - secAt > 5000) {
+            secCache = Sections.all(this)
+            secAt = n
+        }
+        return secCache
+    }
+
     private fun guardable(pkg: String) = pkg.contains("settings") || pkg.contains("packageinstaller")
 
     private fun watching(): Boolean =
-        Policy.rawMode(this) != 0 || Store.feat(this, "p_info") || Store.feat(this, "p_uninst") ||
+        Policy.rawMode(this) != 0 || Policy.katiProtect(this) ||
+            Store.feat(this, "p_info") || Store.feat(this, "p_uninst") ||
             Store.blocked(this).any { it.startsWith("pg:") } ||
-            Pages.all.any { Store.timerLeft(this, "pg:" + it.id) > 0L }
+            Pages.all.any { Store.timerLeft(this, "pg:" + it.id) > 0L || Store.katiOn(this, "pg:" + it.id) }
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         if (e == null) return
@@ -148,23 +167,39 @@ class GuardService : AccessibilityService() {
             if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 val cn = e.className?.toString() ?: ""
                 if (!busy && cover != null && cn.endsWith("LockActivity")) {
-                    h.postDelayed({ if (!busy) hideCover() }, 150)
+                    h.postDelayed({
+                        if (!busy) {
+                            if (isSplit()) kick("Bölünmüş ekran engelli") else hideCover()
+                        }
+                    }, 250)
                 }
             }
             return
         }
 
+        cache()
+        if (!dumpPending && Store.p(this).getBoolean("dump_arm", false) &&
+            !launchSet.contains(pkg) && !protSet.contains(pkg)
+        ) {
+            dumpPending = true
+            h.postDelayed({ doDump(pkg) }, 8000)
+        }
+
         if (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
             if (busy) return
             val now = System.currentTimeMillis()
-            cache()
-            // Engelli uygulamada bir şey yapılırsa yine engel + geri tuşu zinciri
-            if (pkg == current && !protSet.contains(pkg) && !launchSet.contains(pkg) && now - lastEnforce > 800) {
-                lastEnforce = now
-                val b = Policy.blockInfo(this, pkg)
-                if (b.kind >= 2) {
-                    enforce(pkg, pkg, b, "")
-                    return
+            if (pkg == current && !protSet.contains(pkg) && !launchSet.contains(pkg)) {
+                if (now - lastEnforce > 800) {
+                    lastEnforce = now
+                    val b = Policy.blockInfo(this, pkg)
+                    if (b.kind >= 2) {
+                        enforce(pkg, pkg, b, "", null)
+                        return
+                    }
+                }
+                if (now - lastSec > 350) {
+                    lastSec = now
+                    if (sectionGuard(pkg)) return
                 }
             }
             if (guardable(pkg) && watching() && now - lastScan > 250) {
@@ -174,7 +209,6 @@ class GuardService : AccessibilityService() {
             return
         }
 
-        cache()
         if (launchSet.contains(pkg)) {
             if (Store.relock(this) == 0) unlockAt.clear()
             current = ""
@@ -184,7 +218,8 @@ class GuardService : AccessibilityService() {
         if (pkg != current) {
             if (Store.relock(this) == 0) {
                 unlockAt.remove(current)
-                if (current.contains("settings")) clearPages()
+                clearPrefix("pg:")
+                clearPrefix("sc:")
             }
             current = pkg
         }
@@ -195,15 +230,21 @@ class GuardService : AccessibilityService() {
         }
         val b = Policy.blockInfo(this, pkg)
         if (b.kind >= 2) {
-            enforce(pkg, pkg, b, "")
-        } else if (b.kind == 1 && !isUnlocked(pkg)) {
-            if (isSplit()) kick("Bölünmüş ekran engelli") else lockApp(pkg)
+            enforce(pkg, pkg, b, "", null)
+            return
         }
+        if (b.kind == 1 && !isUnlocked(pkg)) {
+            if (isSplit()) kick("Bölünmüş ekran engelli") else lockApp(pkg)
+            return
+        }
+        if (sectionGuard(pkg)) return
+        h.postDelayed({ if (!busy && current == pkg) sectionGuard(pkg) }, 600)
     }
 
     // Ana ekranda Secure Lock simgesine basılı tutulursa Kaldır menüsü yerine blok ekranı
     private fun longClick(e: AccessibilityEvent, pkg: String) {
-        if (busy || !Store.feat(this, "p_launch") || Policy.uninstallOpen(this)) return
+        if (busy || Policy.uninstallOpen(this)) return
+        if (!Store.feat(this, "p_launch") && !Policy.katiProtect(this)) return
         cache()
         if (!launchSet.contains(pkg)) return
         val sb = StringBuilder()
@@ -227,28 +268,173 @@ class GuardService : AccessibilityService() {
         if (!busy && current == pkg && watching()) pageGuard(pkg)
     }
 
-    // Ayarlar sayfalarını başlıklarından tanıyıp içeri sokmaz
+    // ---------- uygulama ici bolumler (Shorts, Reels ...) ----------
+
+    private fun sectionGuard(pkg: String): Boolean {
+        val list = sections().filter { it.pkg == pkg }
+        if (list.isEmpty()) return false
+        val root = try {
+            rootInActiveWindow
+        } catch (e: Exception) {
+            null
+        } ?: return false
+        if (root.packageName?.toString() != pkg) return false
+        for (s in list) {
+            val key = "sc:" + s.id
+            val b = Policy.blockInfo(this, key)
+            if (b.kind == 0) continue
+            if (!matchRules(root, Sections.rules(this, s))) continue
+            if (b.kind >= 2) {
+                enforce(key, null, b, s.name, s)
+                return true
+            }
+            if (b.kind == 1 && !isUnlocked(key)) {
+                lockApp(key)
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun sectionStillOn(s: Sections.Sec): Boolean {
+        val root = try {
+            rootInActiveWindow
+        } catch (e: Exception) {
+            null
+        } ?: return false
+        if (root.packageName?.toString() != s.pkg) return false
+        return matchRules(root, Sections.rules(this, s))
+    }
+
+    private fun matchRules(root: AccessibilityNodeInfo, rules: String): Boolean {
+        val ids = ArrayList<String>()
+        val sel = ArrayList<String>()
+        val txt = ArrayList<String>()
+        for (ln in rules.split("\n")) {
+            val l = ln.trim()
+            if (l.isEmpty()) continue
+            if (l.startsWith("id:")) {
+                val w = l.substring(3).trim().lowercase(Locale.ROOT)
+                if (w.isNotEmpty()) ids.add(w)
+            } else if (l.startsWith("sec:")) {
+                val w = norm(l.substring(4))
+                if (w.isNotEmpty()) sel.add(w)
+            } else {
+                val w = norm(l)
+                if (w.isNotEmpty()) txt.add(w)
+            }
+        }
+        if (ids.isEmpty() && sel.isEmpty() && txt.isEmpty()) return false
+        return walk(root, ids, sel, txt, intArrayOf(0), 0)
+    }
+
+    private fun walk(
+        n: AccessibilityNodeInfo?, ids: List<String>, sel: List<String>,
+        txt: List<String>, cnt: IntArray, d: Int
+    ): Boolean {
+        if (n == null || cnt[0] > 700 || d > 40) return false
+        cnt[0]++
+        try {
+            if (n.isVisibleToUser) {
+                val id = n.viewIdResourceName
+                if (id != null && ids.isNotEmpty()) {
+                    val low = id.lowercase(Locale.ROOT)
+                    for (f in ids) if (low.contains(f)) return true
+                }
+                val t = n.text?.toString() ?: ""
+                val cd = n.contentDescription?.toString() ?: ""
+                if (sel.isNotEmpty() && n.isSelected) {
+                    val s = norm("$t $cd")
+                    for (w in sel) if (s.contains(w)) return true
+                }
+                if (txt.isNotEmpty() && (t.isNotEmpty() || cd.isNotEmpty())) {
+                    val s = norm("$t $cd")
+                    for (w in txt) if (s.contains(w)) return true
+                }
+            }
+        } catch (e: Exception) {
+        }
+        for (i in 0 until n.childCount) {
+            if (walk(n.getChild(i), ids, sel, txt, cnt, d + 1)) return true
+        }
+        return false
+    }
+
+    // Tanıma yardımcısı: o an açık uygulamanın ekran içeriğini kaydeder
+    private fun doDump(pkg: String) {
+        dumpPending = false
+        Store.p(this).edit().putBoolean("dump_arm", false).apply()
+        val sb = StringBuilder()
+        sb.append("Paket: ").append(pkg).append("\n")
+        try {
+            val root = rootInActiveWindow
+            if (root != null) {
+                dumpNode(root, sb, intArrayOf(0), 0)
+            } else {
+                sb.append("Pencere okunamadı\n")
+            }
+        } catch (e: Exception) {
+            sb.append("Hata: ").append(e.message)
+        }
+        Store.p(this).edit().putString("dump", sb.toString().take(12000)).apply()
+        Toast.makeText(this, "İnceleme kaydedildi", Toast.LENGTH_LONG).show()
+    }
+
+    private fun dumpNode(n: AccessibilityNodeInfo?, sb: StringBuilder, cnt: IntArray, d: Int) {
+        if (n == null || cnt[0] > 450 || d > 40) return
+        cnt[0]++
+        try {
+            if (n.isVisibleToUser) {
+                val id = n.viewIdResourceName
+                val t = n.text
+                val cd = n.contentDescription
+                if (id != null || (t != null && t.isNotEmpty()) || (cd != null && cd.isNotEmpty())) {
+                    sb.append(id?.substringAfter(":id/") ?: "-")
+                        .append(" | ").append(t ?: "")
+                        .append(" | ").append(cd ?: "")
+                    if (n.isSelected) sb.append(" | SECILI")
+                    sb.append("\n")
+                }
+            }
+        } catch (e: Exception) {
+        }
+        for (i in 0 until n.childCount) dumpNode(n.getChild(i), sb, cnt, d + 1)
+    }
+
+    // ---------- ayarlar sayfalari ----------
+
     private fun pageGuard(pkg: String): Boolean {
         val mode = Policy.mode(this)
-        if (mode == 2 && Store.feat(this, "k_allset") && pkg == "com.android.settings") {
+        val kp = Policy.katiProtect(this)
+        if (kp && Store.feat(this, "k_allset") && pkg == "com.android.settings") {
             kick("Ayarlar kilitli")
             return true
         }
         val t = pageTexts(pkg)
         if (t.isEmpty()) return false
         val open = Policy.uninstallOpen(this)
+        val ours = t.any { it.contains("secure lock") }
 
         if (pkg.contains("packageinstaller")) {
-            if (!open && Store.feat(this, "p_uninst") && t.any { it.contains("secure lock") }) {
+            val uninstall = t.any { it.contains("kaldir") || it.contains("uninstall") }
+            if (!open && ours && uninstall && (kp || Store.feat(this, "p_uninst"))) {
                 kick("Kaldırma engelli")
                 return true
             }
             return false
         }
 
+        // "Devre dışı bırak ve kaldır" gibi cihaz yöneticisi pencereleri
+        if (!open && kp && ours && Policy.adminActive(this) &&
+            t.any { s -> ADMIN_W.any { w -> s.contains(w) } }
+        ) {
+            kick("Kaldırma engelli")
+            return true
+        }
+
         if (t.take(12).any { it == "secure lock" }) {
             val info = t.any { INFO_W.contains(it) }
-            if (!open && (mode != 0 || (info && Store.feat(this, "p_info")))) {
+            if (!open && (kp || mode != 0 || (info && Store.feat(this, "p_info")))) {
                 kick("Secure Lock korumalı")
                 return true
             }
@@ -261,7 +447,7 @@ class GuardService : AccessibilityService() {
             val key = "pg:" + pg.id
             val b = Policy.pageInfo(this, pg.id)
             if (b.kind >= 2) {
-                enforce(key, null, b, pg.name)
+                enforce(key, null, b, pg.name, null)
                 return true
             }
             if (b.kind == 1 && !isUnlocked(key)) {
@@ -339,6 +525,13 @@ class GuardService : AccessibilityService() {
         h.postDelayed({ performGlobalAction(GLOBAL_ACTION_HOME) }, 150L + n * 90L + 60L)
     }
 
+    // Bölümden nazikçe çık: iki Geri, hâlâ bölümdeyse tam zincir
+    private fun leaveSoft(s: Sections.Sec) {
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        h.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, 300)
+        h.postDelayed({ if (sectionStillOn(s)) leave() }, 1000)
+    }
+
     private fun kick(msg: String) {
         if (busy) return
         val now = System.currentTimeMillis()
@@ -356,8 +549,8 @@ class GuardService : AccessibilityService() {
         }, Store.ssec(this) * 1000L)
     }
 
-    // Sıkı: kalan süre akar. Katı: 3-2-1 geri sayım. İkisinde de Geri tuşu zinciri çalışır.
-    private fun enforce(key: String, killPkg: String?, b: Blk, title: String) {
+    // Sıkı: kalan süre akar. Katı: 3-2-1 geri sayım. Tüm ekranı kaplar, Geri tuşu zinciri çalışır.
+    private fun enforce(key: String, killPkg: String?, b: Blk, title: String, sec: Sections.Sec?) {
         if (busy) return
         busy = true
         val now = System.currentTimeMillis()
@@ -372,20 +565,24 @@ class GuardService : AccessibilityService() {
         }
         val hard = b.kind == 3
         val secs = if (hard) Store.ghostSecs(this) else Store.ssec(this)
-        val top = if (title.isNotEmpty()) title else if (hard) "Katı Mod" else "Sıkı Mod"
+        val top = if (title.isNotEmpty()) title else if (hard) "Katı" else "Sıkı"
         val msg = Store.ghostMsg(this)
-        val sub = Store.randomLine(this)
-        val sp = if (hard) 72 else 40
+        val line = Store.randomLine(this)
+        val count = "Bugün " + Store.att(this, 0) + ". deneme"
+        val sub = if (line.isEmpty()) count else line + "\n" + count
+        val sp = if (hard) 80 else 44
         fun big(i: Int): String = if (hard) (secs - i).toString() else fmtLeft(b.left - i * 1000L)
 
         showCover(top, msg, big(0), sp, sub)
-        leave()
+        if (sec != null) leaveSoft(sec) else leave()
         if (killPkg != null) h.postDelayed({ kill(killPkg) }, 700)
         for (i in 1 until secs) {
             h.postDelayed({
                 setCover(top, msg, big(i), sp, sub)
                 if (killPkg != null) kill(killPkg)
-                if (i == 1) leave()
+                if (i == 1) {
+                    if (sec == null) leave() else if (sectionStillOn(sec)) leave()
+                }
             }, i * 1000L)
         }
         val endStrike = strike
@@ -448,9 +645,9 @@ class GuardService : AccessibilityService() {
                 col.addView(t, LinearLayout.LayoutParams(-2, -2))
                 return t
             }
-            val tt = mk(15f, Color.parseColor("#999999"))
-            val tm = mk(24f, Color.WHITE)
-            val tn = mk(72f, Color.WHITE)
+            val tt = mk(18f, Color.parseColor("#AAAAAA"))
+            val tm = mk(30f, Color.WHITE)
+            val tn = mk(80f, Color.WHITE)
             val ts = mk(17f, Color.parseColor("#BBBBBB"))
             fl.addView(col, FrameLayout.LayoutParams(mp, mp))
             val lp = WindowManager.LayoutParams(
