@@ -2,7 +2,11 @@ package com.securelock.app
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.admin.DeviceAdminInfo
+import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -38,6 +42,9 @@ class MainActivity : Activity() {
     private var backFn: (() -> Unit)? = null
     private var tickR: Runnable? = null
     private var shownMode = 0
+    private var pendingTv: TextView? = null
+    private var pendingKey = ""
+    private var pendingRefresh: (() -> Unit)? = null
     private val h = Handler(Looper.getMainLooper())
     private val green = Color.parseColor("#66BB6A")
     private val red = Color.parseColor("#E57373")
@@ -85,6 +92,15 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         val f = backFn
         if (f != null) f() else finish()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 77) {
+            toast(if (Policy.adminActive(this)) "Cihaz yöneticisi etkin" else "Cihaz yöneticisi etkinleştirilmedi")
+            if (authed) perms()
+        }
     }
 
     // ---------- yardimcilar ----------
@@ -138,6 +154,22 @@ class MainActivity : Activity() {
                 d.dismiss()
                 ok(i)
             }
+            .show()
+    }
+
+    private fun inputDialog(title: String, hint: String, cur: String, ok: (String) -> Unit) {
+        val e = EditText(this)
+        e.hint = hint
+        e.setText(cur)
+        e.setSelection(e.text.length)
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(e)
+            .setPositiveButton("Tamam") { _, _ ->
+                val s = e.text.toString().trim()
+                if (s.isEmpty()) toast("Boş bırakılamaz") else ok(s)
+            }
+            .setNegativeButton("Vazgeç", null)
             .show()
     }
 
@@ -275,7 +307,7 @@ class MainActivity : Activity() {
 
     private fun setup() {
         askText("Yönetici şifresi", "Uygulamaya her girişte sorulur. Kurtarma yöntemi yoktur, unutma.", false, 4, null) { admin ->
-            askText("Katı Mod şifresi", "Sıkı ve Katı Mod başlatılırken, Katı blok koyarken ve kaldırma izni verirken sorulur. Kurtarma yöntemi yoktur.", false, 4, null) { strict ->
+            askText("Katı Mod şifresi", "Katı koyarken ve kaldırırken, Sıkı Mod başlatırken sorulur. Kurtarma yöntemi yoktur.", false, 4, null) { strict ->
                 pickLock(null) { t, s ->
                     Store.setAdmin(this, admin)
                     Store.setStrict(this, strict)
@@ -396,15 +428,13 @@ class MainActivity : Activity() {
     // ---------- kendine blok ekranlari ----------
 
     private fun selfBlockInfo(): Pair<String, Long>? {
-        if (Policy.mode(this) == 2 && !Store.feat(this, "k_enter")) {
-            return Pair("Katı Mod sürüyor. Süre bitince açılır.", Policy.remaining(this))
-        }
         val l = Clock.left(this, "self")
         if (l > 0L) return Pair("Kendine koyduğun blok sürüyor.", l)
         return null
     }
 
     private fun blockScreen() {
+        pendingTv = null
         val (v, col) = UI.page(this)
         col.gravity = Gravity.CENTER
         col.addView(UI.tv(this, "Secure Lock kilitli", 26f, UI.TXT, true))
@@ -431,6 +461,7 @@ class MainActivity : Activity() {
     }
 
     private fun lockedScreen(title: String, id: String) {
+        pendingTv = null
         val (v, col) = UI.page(this)
         hdr(col, title) { home() }
         col.addView(UI.tv(this, "Bu bölüm şu an kilitli.", 18f, UI.TXT, true), UI.lp(this, 10))
@@ -450,7 +481,7 @@ class MainActivity : Activity() {
                     why.text = "Kendine koyduğun zamanlayıcı sürüyor."
                     tm.text = fmt(l)
                 } else {
-                    why.text = "Sıkı veya Katı Mod sürüyor."
+                    why.text = "Sıkı Mod oturumu sürüyor."
                     tm.text = fmt(Policy.remaining(this@MainActivity))
                 }
                 h.postDelayed(this, 1000)
@@ -461,6 +492,7 @@ class MainActivity : Activity() {
     }
 
     private fun selfScreen() {
+        pendingTv = null
         val (v, col) = UI.page(this)
         hdr(col, "Kendime blok") { home() }
         col.addView(
@@ -512,9 +544,91 @@ class MainActivity : Activity() {
         run.run()
     }
 
-    // ---------- ogeye ozel mod ve zamanlayici ----------
+    // ---------- Katı (kalici) ----------
+
+    private fun tickPending(): Boolean {
+        val tv = pendingTv ?: return false
+        if (!Store.katiOn(this, pendingKey)) {
+            pendingRefresh?.invoke()
+            return true
+        }
+        tv.text = "Kaldırma bekleniyor, kalan: " + fmt(Store.katiExitLeft(this, pendingKey))
+        return false
+    }
+
+    private fun katiEnable(key: String, title: String, done: () -> Unit) {
+        confirm(
+            "Katı: kalıcı",
+            "$title kalıcı olacak, süre yok, şifrenle bile açılmaz. Kaldırmak için Katı şifresi ve 24 saat bekleme gerekir. Devam edilsin mi?"
+        ) {
+            askSecret("Katı Mod şifresi") { s ->
+                if (Store.checkStrict(this, s)) {
+                    Store.setKati(this, key, true)
+                    done()
+                } else {
+                    toast("Katı Mod şifresi yanlış")
+                }
+            }
+        }
+    }
+
+    private fun katiExitControls(box: LinearLayout, key: String, title: String, refresh: () -> Unit) {
+        if (Store.katiExitPending(this, key)) {
+            val st = UI.tv(this, "Kaldırma bekleniyor, kalan: " + fmt(Store.katiExitLeft(this, key)), 13f, UI.TXT, true)
+            box.addView(st, UI.lp(this, 8))
+            pendingTv = st
+            pendingKey = key
+            pendingRefresh = refresh
+            box.addView(UI.button(this, "Vazgeç, Katı kalsın") {
+                Store.cancelKatiExit(this, key)
+                refresh()
+            }, UI.lp(this, 8))
+        } else {
+            box.addView(UI.button(this, "Katı'yı kaldır (24 saat beklemeli)") {
+                askSecret("Katı Mod şifresi") { s ->
+                    if (Store.checkStrict(this, s)) {
+                        confirm("Kaldırma başlasın mı?", "$title 24 saat sonra kalkar. O süre boyunca Katı sürer, istersen vazgeçebilirsin.") {
+                            Store.requestKatiExit(this, key)
+                            refresh()
+                        }
+                    } else {
+                        toast("Katı Mod şifresi yanlış")
+                    }
+                }
+            }, UI.lp(this, 8))
+        }
+    }
+
+    private fun katiCard(col: LinearLayout) {
+        val on = Store.katiOn(this, "sys")
+        val c = UI.card(this)
+        c.addView(UI.tv(this, "Katı Koruma: " + (if (on) "Açık" else "Kapalı"), 17f, if (on) green else UI.TXT, true))
+        val info = if (on) {
+            "Secure Lock kaldırılamaz. Erişilebilirlik, Tarih ve saat ile Cihaz yöneticisi sayfalarına girilemez. Süre yok, kalıcı."
+        } else {
+            "Açınca Secure Lock kaldırılamaz, Erişilebilirlik ile Tarih ve saat sayfalarına girilemez. Süre yok, kalıcı."
+        }
+        c.addView(UI.tv(this, info, 13f, UI.DIM), UI.lp(this, 4))
+        if (!Policy.adminActive(this)) {
+            c.addView(
+                UI.tv(this, "Cihaz yöneticisi kapalı. Katı Korumayı açmadan önce Kurulum ve izinler'den etkinleştirmen önerilir.", 12f, red),
+                UI.lp(this, 6)
+            )
+        }
+        if (on) {
+            katiExitControls(c, "sys", "Katı Koruma") { home() }
+        } else {
+            c.addView(UI.button(this, "Katı Korumayı aç", UI.RED) {
+                if (!accOn()) toast("Erişilebilirlik izni kapalı: Kurulum ve izinler") else katiEnable("sys", "Katı Koruma") { home() }
+            }, UI.lp(this, 10))
+        }
+        col.addView(c, UI.lp(this, 10))
+    }
+
+    // ---------- ogeye ozel seviye ----------
 
     private fun itemBlockedScreen(key: String, title: String) {
+        pendingTv = null
         val (v, col) = UI.page(this)
         hdr(col, title) { home() }
         col.addView(UI.tv(this, "Bu öğe şu an kilitli.", 18f, UI.TXT, true), UI.lp(this, 10))
@@ -530,8 +644,13 @@ class MainActivity : Activity() {
                     home()
                     return
                 }
-                why.text = if (b.kind == 3) "Katı: şifreni bilsen de açılmaz." else "Sıkı: süre dolana kadar açılmaz."
-                tm.text = fmt(b.left)
+                if (b.kind == 3) {
+                    why.text = "Katı: kalıcı, şifreni bilsen de açılmaz. Kaldırmak için öğeye basılı tut."
+                    tm.text = ""
+                } else {
+                    why.text = "Sıkı: süre dolana kadar açılmaz."
+                    tm.text = fmt(b.left)
+                }
                 h.postDelayed(this, 1000)
             }
         }
@@ -624,66 +743,79 @@ class MainActivity : Activity() {
         return r
     }
 
-    // kind: 0 uygulama, 1 telefon ayar sayfası, 2 uygulama içi öğe
+    // kind: 0 uygulama, 1 telefon ayar sayfası, 2 uygulama içi düğme, 3 uygulama içi bölüm
     private fun itemScreen(key: String, title: String, kind: Int, back: () -> Unit) {
-        val keep = Policy.mode(this) != 0 && Store.feat(this, "s_keep")
+        pendingTv = null
+        val refresh: () -> Unit = { itemScreen(key, title, kind, back) }
         val (v, col) = UI.page(this)
         hdr(col, title, back)
-        col.addView(UI.tv(this, "Bu öğeye özel ayarlar. Diğerlerinden bağımsız çalışır.", 13f, UI.DIM), UI.lp(this, 4))
+        val stateTv = UI.tv(this, "", 15f, UI.TXT, true)
+        col.addView(stateTv, UI.lp(this, 6))
+        col.addView(UI.tv(this, "Bu öğe için bir seviye seç. Diğer öğelerden bağımsızdır.", 12f, UI.DIM), UI.lp(this, 2))
 
-        col.addView(UI.label(this, "Genel oturumlar"), UI.lp(this, 16))
-        col.addView(UI.tv(this, "Sıkı veya Katı Mod başlatınca bu öğe de etkilensin mi?", 12f, UI.DIM), UI.lp(this, 2))
-        val names = listOf("Normal kilit (şifreyle açılır)", "Sıkı oturuma dahil", "Katı oturuma dahil")
-        val masks = intArrayOf(1, 2, 4)
-        for (i in 0..2) {
-            val mask = masks[i]
-            val on = (Store.tags(this, key) and mask) != 0
-            col.addView(UI.switchRow(this, names[i], on) { nv ->
-                val cur = Store.tags(this, key)
-                if (keep && !nv) {
-                    toast("Oturum sürerken çıkarılamaz")
-                    h.post { itemScreen(key, title, kind, back) }
-                } else {
-                    Store.setTags(this, key, if (nv) (cur or mask) else (cur and mask.inv()))
-                }
-            }, UI.lp(this, 6))
+        val katiOn = Store.katiOn(this, key)
+        val sLeft = Clock.left(this, "is_$key")
+
+        fun level(name: String, info: String, act: () -> Unit) {
+            val c = UI.card(this)
+            c.addView(UI.tv(this, name, 16f, UI.TXT, true))
+            c.addView(UI.tv(this, info, 12f, UI.DIM), UI.lp(this, 2))
+            c.isClickable = true
+            c.setOnClickListener { act() }
+            col.addView(c, UI.lp(this, 8))
         }
 
-        col.addView(UI.label(this, "Bu öğeye özel zamanlayıcı"), UI.lp(this, 18))
-        col.addView(
-            UI.tv(this, "Genel oturum olmadan sadece bu öğeyi süreli engeller. Süre bitince kendiliğinden kalkar. Kısaltılamaz, eklenebilir.", 12f, UI.DIM),
-            UI.lp(this, 2)
-        )
-        val sTv = UI.tv(this, "", 12f, UI.DIM)
-        val kTv = UI.tv(this, "", 12f, UI.DIM)
-
-        fun timerCard(name: String, info: String, st: TextView, strict: Boolean) {
-            val c = UI.card(this)
-            c.addView(UI.tv(this, name, 16f))
-            c.addView(UI.tv(this, info, 12f, UI.DIM), UI.lp(this, 2))
-            c.addView(st, UI.lp(this, 4))
-            c.isClickable = true
-            c.setOnClickListener {
-                pickDuration("$title: $name") { ms, txt ->
-                    val doIt = {
-                        Clock.add(this, (if (strict) "ik_" else "is_") + key, ms)
-                        itemScreen(key, title, kind, back)
-                    }
+        level("Serbest", "Kısıtlama yok.") {
+            if (katiOn) {
+                toast("Katı'yı kaldırmak için aşağıdaki düğmeyi kullan")
+            } else if (sLeft > 0L) {
+                toast("Sıkı süre bitmeden kaldırılamaz")
+            } else {
+                Store.setTags(this, key, 0)
+                refresh()
+            }
+        }
+        level("Normal", "Şifreyle açılır.") {
+            if (katiOn) {
+                toast("Katı'yı kaldırmak için aşağıdaki düğmeyi kullan")
+            } else {
+                Store.setTags(this, key, Store.tags(this, key) or 1)
+                refresh()
+            }
+        }
+        level("Sıkı (süreli)", "Süre dolana kadar şifre işe yaramaz. Engel ekranında kalan süre akar. Süre bitince kendiliğinden kalkar.") {
+            if (katiOn) {
+                toast("Zaten Katı")
+            } else {
+                pickDuration("$title: Sıkı süre") { ms, txt ->
                     confirm("Geri dönüş yok", "$title $txt boyunca engelli kalacak. Kısaltılamaz. Devam edilsin mi?") {
-                        if (strict) {
-                            askSecret("Katı Mod şifresi") { s ->
-                                if (Store.checkStrict(this, s)) doIt() else toast("Katı Mod şifresi yanlış")
-                            }
-                        } else {
-                            doIt()
-                        }
+                        Clock.add(this, "is_$key", ms)
+                        refresh()
                     }
                 }
             }
-            col.addView(c, UI.lp(this, 8))
         }
-        timerCard("Sıkı blok", "Süre dolana kadar şifre işe yaramaz. Engel ekranında kalan süre görünür.", sTv, false)
-        timerCard("Katı blok", "Şifreni bilsen de açılmaz. Engel ekranında 3-2-1 geri sayım olur. Katı Mod şifresi ister.", kTv, true)
+        level("Katı (kalıcı)", "Süre yok, şifreyle açılmaz. Engel ekranında 3-2-1 geri sayım olur. Kaldırmak için Katı şifresi ve 24 saat bekleme gerekir.") {
+            if (katiOn) toast("Zaten Katı") else katiEnable(key, title) { refresh() }
+        }
+
+        col.addView(UI.switchRow(this, "Sıkı Mod oturumuna dahil (ders programı)", (Store.tags(this, key) and 2) != 0) { nv ->
+            val cur = Store.tags(this, key)
+            val keep = Policy.mode(this) != 0 && Store.feat(this, "s_keep")
+            if (keep && !nv) {
+                toast("Oturum sürerken çıkarılamaz")
+                h.post { refresh() }
+            } else {
+                Store.setTags(this, key, if (nv) (cur or 2) else (cur and 2.inv()))
+            }
+        }, UI.lp(this, 14))
+
+        if (katiOn) {
+            val c = UI.card(this)
+            c.addView(UI.tv(this, "Katı kaldırma", 15f, UI.TXT, true))
+            katiExitControls(c, key, title, refresh)
+            col.addView(c, UI.lp(this, 12))
+        }
 
         if (kind == 0) {
             val cur = if (Store.hasAppLock(this, key)) "özel " + typeName(Store.appType(this, key)) else "genel kilit"
@@ -693,13 +825,41 @@ class MainActivity : Activity() {
             }, UI.lp(this, 6))
         }
 
+        if (kind == 3) {
+            val s = Sections.all(this).firstOrNull { "sc:" + it.id == key }
+            if (s != null) {
+                col.addView(UI.label(this, "Bölüm tanıma"), UI.lp(this, 18))
+                col.addView(UI.rowBtn(this, "Tanıma kuralları", "Uygulama: " + s.pkg) {
+                    rulesDialog(s) { refresh() }
+                }, UI.lp(this, 6))
+                if (Sections.isCustom(s.id)) {
+                    col.addView(UI.button(this, "Bu bölümü sil", UI.RED) {
+                        if (Store.katiOn(this, key)) {
+                            toast("Katı: önce Katı'yı kaldır")
+                        } else {
+                            confirm("Bölüm silinsin mi?", "$title listeden kalkar.") {
+                                Store.setTags(this, key, 0)
+                                Clock.clear(this, "is_$key")
+                                Sections.removeCustom(this, s.id)
+                                sectionsScreen()
+                            }
+                        }
+                    }, UI.lp(this, 10))
+                }
+            }
+        }
+
         show(v, back)
         val run = object : Runnable {
             override fun run() {
-                val s = Clock.left(this@MainActivity, "is_$key")
-                val k = Clock.left(this@MainActivity, "ik_$key")
-                sTv.text = if (s > 0L) "Aktif, kalan: " + fmt(s) else "Serbest (dokun, süre seç)"
-                kTv.text = if (k > 0L) "Aktif, kalan: " + fmt(k) else "Serbest (dokun, süre seç)"
+                if (tickPending()) return
+                val b = Policy.blockInfo(this@MainActivity, key)
+                stateTv.text = "Şu an: " + when (b.kind) {
+                    3 -> "Katı (kalıcı)"
+                    2 -> "Sıkı, kalan " + fmt(b.left)
+                    1 -> "Normal"
+                    else -> "Serbest"
+                }
                 h.postDelayed(this, 1000)
             }
         }
@@ -707,9 +867,32 @@ class MainActivity : Activity() {
         run.run()
     }
 
+    private fun rulesDialog(s: Sections.Sec, back: () -> Unit) {
+        val e = EditText(this)
+        e.setText(Sections.rules(this, s))
+        e.minLines = 5
+        e.textSize = 13f
+        e.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        AlertDialog.Builder(this)
+            .setTitle(s.name + ": tanıma kuralları")
+            .setMessage("Her satır bir kural. id:kelime = ekrandaki bileşen adı, sec:kelime = seçili sekme, düz kelime = ekranda görünen yazı.")
+            .setView(e)
+            .setPositiveButton("Kaydet") { _, _ ->
+                Sections.setRules(this, s.id, e.text.toString().take(1500))
+                back()
+            }
+            .setNeutralButton("Varsayılan") { _, _ ->
+                Sections.resetRules(this, s.id)
+                back()
+            }
+            .setNegativeButton("Vazgeç", null)
+            .show()
+    }
+
     // ---------- ana ekran ----------
 
     private fun home() {
+        pendingTv = null
         val mode = Policy.mode(this)
         shownMode = mode
         val back: () -> Unit = { home() }
@@ -725,16 +908,21 @@ class MainActivity : Activity() {
             col.addView(UI.tv(this, "Erişilebilirlik izni kapalı: koruma çalışmıyor.", 14f, red), UI.lp(this, 10))
         }
         if (mode == 0) {
-            col.addView(optBtn(back, "siki", "Sıkı Mod başlat", color = UI.ACC) { sessionScreen(1) }, UI.lp(this, 14))
-            col.addView(optBtn(back, "kati", "Katı Mod başlat", color = UI.RED) { sessionScreen(2) }, UI.lp(this, 8))
+            col.addView(optBtn(back, "siki", "Sıkı Mod başlat", color = UI.ACC) { sessionScreen() }, UI.lp(this, 14))
         }
-        val appN = Store.blocked(this).count { !it.startsWith("pg:") && !it.startsWith("ui:") }
+        katiCard(col)
+        val appN = Store.blocked(this).count {
+            !it.startsWith("pg:") && !it.startsWith("ui:") && !it.startsWith("sc:")
+        }
         val pgN = Store.blocked(this).count { it.startsWith("pg:") }
         col.addView(optBtn(back, "apps", "Engellenecek uygulamalar", "Engellenecek uygulamalar ($appN)") {
             gate("apps", "Uygulama listesi") { appsScreen() }
-        }, UI.lp(this, 8))
+        }, UI.lp(this, 10))
         col.addView(optBtn(back, "pages", "Telefon ayar sayfaları", "Telefon ayar sayfaları ($pgN)") {
             gate("pages", "Telefon ayar sayfaları") { pagesScreen() }
+        }, UI.lp(this, 8))
+        col.addView(optBtn(back, "sections", "Uygulama içi bölümler", "Uygulama içi bölümler (Shorts, Reels)") {
+            sectionsScreen()
         }, UI.lp(this, 8))
         col.addView(optBtn(back, "self", "Kendime blok") { selfScreen() }, UI.lp(this, 8))
         col.addView(optBtn(back, "custom", "Özelleştirme") {
@@ -749,12 +937,13 @@ class MainActivity : Activity() {
         col.addView(optBtn(back, "perms", "Kurulum ve izinler") { perms() }, UI.lp(this, 8))
         col.addView(UI.button(this, "Modlar nasıl çalışır?") { modesInfo() }, UI.lp(this, 8))
         col.addView(
-            UI.tv(this, "İpucu: Her düğmeye basılı tutarsan o öğe için ayrı mod ve zamanlayıcı koyabilirsin.", 12f, UI.DIM),
+            UI.tv(this, "İpucu: Her düğmeye basılı tutarsan o öğe için ayrı seviye (Normal, Sıkı, Katı) koyabilirsin.", 12f, UI.DIM),
             UI.lp(this, 12)
         )
         show(v, null)
         val r = object : Runnable {
             override fun run() {
+                if (tickPending()) return
                 val m = Policy.mode(this@MainActivity)
                 if (m != shownMode) {
                     home()
@@ -764,7 +953,7 @@ class MainActivity : Activity() {
                     st.text = "Normal Mod"
                     sub.text = "Engelli uygulamalar şifreyle açılır."
                 } else {
-                    st.text = (if (m == 1) "Sıkı Mod" else "Katı Mod") + " aktif"
+                    st.text = "Sıkı Mod oturumu aktif"
                     sub.text = "Kalan süre: " + fmt(Policy.remaining(this@MainActivity)) +
                         "\nSüre bitene kadar geri dönüş yok."
                 }
@@ -776,6 +965,7 @@ class MainActivity : Activity() {
     }
 
     private fun modesInfo() {
+        pendingTv = null
         val (v, col) = UI.page(this)
         hdr(col, "Modlar nasıl çalışır?") { home() }
         fun block(title: String, body: String) {
@@ -785,40 +975,45 @@ class MainActivity : Activity() {
             col.addView(c, UI.lp(this, 12))
         }
         block(
-            "Normal Mod: şifre kapısı",
+            "Normal: şifre kapısı",
             "Engelli uygulama açılınca şifre ekranı çıkar. Doğru şifre yazınca açılır. Yeniden kilitleme zamanını Özelleştirme'den seçersin."
         )
         block(
-            "Sıkı Mod: zaman kilidi",
-            "Süre dolana kadar şifre işe yaramaz. Engel ekranında kalan süre akar. Arkadaki uygulama Geri tuşu zinciriyle kapatılır. Süre bitince kilit kendiliğinden kalkar. Zamanlayıcı bozulmasın diye Erişilebilirlik ile Tarih ve saat sayfaları engellenir. Secure Lock'a girebilirsin."
+            "Sıkı: zaman kilidi",
+            "Süre dolana kadar şifre işe yaramaz. Engel ekranında kalan süre akar, arkadaki uygulama Geri tuşu zinciriyle kapatılır. Süre bitince kilit kendiliğinden kalkar. Bir öğeye tek başına koyabilirsin ya da ana ekrandaki Sıkı Mod ile \"ders oturumuna dahil\" tüm öğelere birden."
         )
         block(
-            "Katı Mod: demir yumruk",
-            "Şifreni bilsen de açılmaz. Engel ekranında 3-2-1 geri sayım olur. Ceza sert: 2 denemede ekran kilitlenir. Cihaz yöneticisi sayfası, Secure Lock bilgi sayfası ve kaldırma penceresi engellenir. İstersen Secure Lock'a girişi de kapatırsın (Özelleştirme)."
+            "Katı: kalıcı",
+            "Süre yok, şifreyle açılmaz. Engel ekranında 3-2-1 geri sayım olur ve ceza sert (2 denemede ekran kilitlenir). Kaldırmak için Katı şifresi ve 24 saat bekleme gerekir, o arada vazgeçebilirsin."
         )
         block(
-            "Öğeye özel kullanım",
-            "Uygulamaya, telefon ayar sayfasına ya da Secure Lock'un içindeki herhangi bir düğmeye basılı tut. Orada o öğeye özel Sıkı veya Katı blok koyarsın. Genel oturum başlatmana gerek kalmaz."
+            "Katı Koruma",
+            "Secure Lock'un kendisini korur: Ayarlar'da bilgi sayfası ve kaldırma engellenir, Erişilebilirlik, Tarih ve saat ile Cihaz yöneticisi sayfalarına girilemez."
+        )
+        block(
+            "Uygulama içi bölümler",
+            "YouTube Shorts, Instagram Reels, Facebook Reels gibi bölümleri uygulamanın tamamını kapatmadan engeller. Bölüme dokun, seviye seç."
         )
         show(v)
     }
 
-    // ---------- Sıkı / Katı Mod ----------
+    // ---------- Sıkı Mod oturumu (ders programı) ----------
 
-    private fun hasTagFor(mode: Int): Boolean {
-        val mask = if (mode == 1) 2 else 6
-        return Store.blocked(this).any { (Store.tags(this, it) and mask) != 0 }
-    }
+    private fun hasSessionItems(): Boolean =
+        Store.blocked(this).any { (Store.tags(this, it) and 2) != 0 }
 
-    private fun sessionScreen(mode: Int) {
+    private fun sessionScreen() {
+        pendingTv = null
         val (v, col) = UI.page(this)
-        hdr(col, if (mode == 1) "Sıkı Mod" else "Katı Mod") { home() }
-        val info = if (mode == 1) {
-            "Zaman kilidi: süre bitene kadar \"Sıkı oturuma dahil\" öğeler hiçbir şifreyle açılmaz. Engel ekranında kalan süre görünür. Erişilebilirlik ve Tarih ve saat sayfaları engellenir."
-        } else {
-            "Demir yumruk: Sıkı Mod'un hepsi, ek olarak \"Katı oturuma dahil\" öğeler, 3-2-1 geri sayım, sert ceza ve sistem korumaları. Cihaz yöneticisi gerekmez."
-        }
-        col.addView(UI.tv(this, info, 14f, UI.DIM), UI.lp(this, 4))
+        hdr(col, "Sıkı Mod") { home() }
+        col.addView(
+            UI.tv(
+                this,
+                "Zaman kilidi (ders programı): süre bitene kadar \"Sıkı Mod oturumuna dahil\" öğeler hiçbir şifreyle açılmaz. Engel ekranında kalan süre akar. Erişilebilirlik ile Tarih ve saat sayfaları engellenir. Süre bitince kendiliğinden kalkar.",
+                14f, UI.DIM
+            ),
+            UI.lp(this, 4)
+        )
         val num = UI.input(this, "Süre (sayı)", false)
         num.inputType = InputType.TYPE_CLASS_NUMBER
         num.setText("1")
@@ -827,22 +1022,17 @@ class MainActivity : Activity() {
         col.addView(durationRow(sel), UI.lp(this, 8))
         val pw = UI.input(this, "Katı Mod şifresi", false)
         col.addView(pw, UI.lp(this, 12))
-        col.addView(UI.button(this, "Başlat", if (mode == 1) UI.ACC else UI.RED) {
+        col.addView(UI.button(this, "Başlat", UI.ACC) {
             val n = num.text.toString().toLongOrNull() ?: 0L
             val unit = sel[0]
             when {
                 n < 1L || n > 99999L -> toast("Süre için 1 ile 99999 arası bir sayı yaz")
                 !Store.checkStrict(this, pw.text.toString()) -> toast("Katı Mod şifresi yanlış")
-                !hasTagFor(mode) -> toast("Bu mod için işaretli öğe yok. Önce listeden ekle.")
+                !hasSessionItems() -> toast("Oturuma dahil öğe yok. Önce listeden ekle.")
                 !accOn() -> toast("Erişilebilirlik izni kapalı: Kurulum ve izinler")
                 else -> confirm("Geri dönüş yok", "$n ${unitNames[unit]} boyunca hiçbir şifreyle bozulamaz. Başlatılsın mı?") {
-                    Policy.start(this, mode, n * unitMs[unit])
-                    if (mode == 2 && !Store.feat(this, "k_enter")) {
-                        authed = false
-                        finish()
-                    } else {
-                        home()
-                    }
+                    Policy.start(this, n * unitMs[unit])
+                    home()
                 }
             }
         }, UI.lp(this, 16))
@@ -884,21 +1074,22 @@ class MainActivity : Activity() {
     }
 
     private fun subText(key: String): String {
+        if (Store.katiOn(this, key)) {
+            return if (Store.katiExitPending(this, key)) "Katı (kaldırma bekleniyor)" else "Katı (kalıcı)"
+        }
         val t = Store.tags(this, key)
         val parts = ArrayList<String>()
         if ((t and 1) != 0) parts.add("Normal")
-        if ((t and 2) != 0) parts.add("Sıkı")
-        if ((t and 4) != 0) parts.add("Katı")
-        var s = if (parts.isEmpty()) "Engelsiz" else parts.joinToString(" + ")
+        if ((t and 2) != 0) parts.add("Ders oturumu")
+        var s = if (parts.isEmpty()) "Serbest" else parts.joinToString(" + ")
         val ts = Clock.left(this, "is_$key")
-        val tk = Clock.left(this, "ik_$key")
-        if (ts > 0L) s += "  |  Sıkı blok: " + fmt(ts)
-        if (tk > 0L) s += "  |  Katı blok: " + fmt(tk)
+        if (ts > 0L) s += "  |  Sıkı: " + fmt(ts)
         if (Store.hasAppLock(this, key)) s += "  |  özel " + typeName(Store.appType(this, key))
         return s
     }
 
     private fun appsScreen() {
+        pendingTv = null
         val showSys = Store.feat(this, "sys")
         val apps = loadApps(showSys)
         val keep = Policy.mode(this) != 0 && Store.feat(this, "s_keep")
@@ -914,7 +1105,7 @@ class MainActivity : Activity() {
         val hint = if (keep) {
             "Oturum sürüyor: uygulama eklenebilir, çıkarılamaz."
         } else {
-            "Anahtar Normal + Sıkı + Katı'yı birden açar. Uygulamaya basılı tut: ayrı mod ve zamanlayıcı koy."
+            "Anahtar Normal kilit + ders oturumunu açar. Uygulamaya basılı tut: Sıkı, Katı ve özel şifre."
         }
         root.addView(UI.tv(this, hint, 12f, UI.DIM), UI.lp(this, 6))
         root.addView(UI.switchRow(this, "Sistem uygulamalarını göster", showSys) { on ->
@@ -972,17 +1163,23 @@ class MainActivity : Activity() {
             }
 
             place(if (Store.lockedNow(this, pkg)) lockedBox else otherBox)
+            var rev = false
             sw.setOnCheckedChangeListener { b, on ->
-                if (on) {
-                    if (Store.tags(this, pkg) == 0) Store.setTags(this, pkg, 7)
-                } else if (keep) {
-                    b.isChecked = true
-                } else {
-                    Store.setTags(this, pkg, 0)
+                if (!rev) {
+                    if (on) {
+                        if (Store.tags(this, pkg) == 0) Store.setTags(this, pkg, 3)
+                    } else if (keep || Store.katiOn(this, pkg)) {
+                        rev = true
+                        b.isChecked = true
+                        rev = false
+                        toast(if (Store.katiOn(this, pkg)) "Katı: önce Katı'yı kaldır" else "Oturum sürerken çıkarılamaz")
+                    } else {
+                        Store.setTags(this, pkg, 0)
+                    }
+                    subTv.text = subText(pkg)
+                    place(if (Store.lockedNow(this, pkg)) lockedBox else otherBox)
+                    lockedHdr.text = "Kilitli uygulamalar (" + lockedBox.childCount + ")"
                 }
-                subTv.text = subText(pkg)
-                place(if (Store.lockedNow(this, pkg)) lockedBox else otherBox)
-                lockedHdr.text = "Kilitli uygulamalar (" + lockedBox.childCount + ")"
             }
             row.addView(sw)
             row.setOnClickListener { if (sw.isEnabled) sw.toggle() }
@@ -1044,24 +1241,18 @@ class MainActivity : Activity() {
     // ---------- telefon ayar sayfalari ----------
 
     private fun pagesScreen() {
+        pendingTv = null
         val keep = Policy.mode(this) != 0 && Store.feat(this, "s_keep")
         val (v, col) = UI.page(this)
         hdr(col, "Telefon ayar sayfaları") { home() }
         col.addView(
             UI.tv(
                 this,
-                "Ayarlar uygulamasının tamamını değil, sadece seçtiğin sayfayı engeller. Anahtar üç modu birden açar; ayrı mod ve zamanlayıcı için basılı tut. Sıkı Mod'da Erişilebilirlik ile Tarih ve saat zaten otomatik engelli (Özelleştirme'den kapatılır).",
+                "Ayarlar uygulamasının tamamını değil, sadece seçtiğin sayfayı engeller. Anahtar Normal kilit + ders oturumunu açar; Sıkı ve Katı için sayfaya basılı tut. Sıkı oturumda ve Katı Koruma açıkken Erişilebilirlik ile Tarih ve saat zaten otomatik engelli.",
                 13f, UI.DIM
             ),
             UI.lp(this, 4)
         )
-        col.addView(UI.button(this, "Hassas sayfaları ekle (Sıkı ve Katı)", UI.ACC) {
-            for (id in listOf("acc", "gm", "date", "admin")) {
-                val k = "pg:$id"
-                Store.setTags(this, k, Store.tags(this, k) or 6)
-            }
-            pagesScreen()
-        }, UI.lp(this, 12))
         for (pg in Pages.all) {
             val key = "pg:" + pg.id
             val row = UI.card(this)
@@ -1076,15 +1267,21 @@ class MainActivity : Activity() {
             val sw = Switch(this)
             sw.isChecked = Store.tags(this, key) != 0
             if (keep && sw.isChecked) sw.isEnabled = false
+            var rev = false
             sw.setOnCheckedChangeListener { b, on ->
-                if (on) {
-                    if (Store.tags(this, key) == 0) Store.setTags(this, key, 7)
-                } else if (keep) {
-                    b.isChecked = true
-                } else {
-                    Store.setTags(this, key, 0)
+                if (!rev) {
+                    if (on) {
+                        if (Store.tags(this, key) == 0) Store.setTags(this, key, 3)
+                    } else if (keep || Store.katiOn(this, key)) {
+                        rev = true
+                        b.isChecked = true
+                        rev = false
+                        toast(if (Store.katiOn(this, key)) "Katı: önce Katı'yı kaldır" else "Oturum sürerken çıkarılamaz")
+                    } else {
+                        Store.setTags(this, key, 0)
+                    }
+                    subTv.text = subText(key)
                 }
-                subTv.text = subText(key)
             }
             row.addView(sw)
             row.setOnClickListener { if (sw.isEnabled) sw.toggle() }
@@ -1097,14 +1294,90 @@ class MainActivity : Activity() {
         show(v)
     }
 
+    // ---------- uygulama ici bolumler (Shorts, Reels) ----------
+
+    private fun sectionsScreen() {
+        pendingTv = null
+        val (v, col) = UI.page(this)
+        hdr(col, "Uygulama içi bölümler") { home() }
+        col.addView(
+            UI.tv(
+                this,
+                "Uygulamanın tamamını değil, sadece içindeki bölümü engeller (örneğin YouTube Shorts). Bir bölüme dokun, seviye seç: Normal, Sıkı ya da Katı. Katı kalıcıdır.",
+                13f, UI.DIM
+            ),
+            UI.lp(this, 4)
+        )
+        if (!accOn()) {
+            col.addView(UI.tv(this, "Erişilebilirlik izni kapalı: bölümler engellenmez.", 13f, red), UI.lp(this, 8))
+        }
+        for (s in Sections.all(this)) {
+            val key = "sc:" + s.id
+            col.addView(UI.rowBtn(this, s.name, subText(key)) {
+                itemScreen(key, s.name, 3) { sectionsScreen() }
+            }, UI.lp(this, 8))
+        }
+        col.addView(UI.button(this, "Yeni bölüm ekle", UI.ACC) { addSectionFlow() }, UI.lp(this, 16))
+
+        col.addView(UI.label(this, "Tanıma yardımcısı"), UI.lp(this, 18))
+        col.addView(
+            UI.tv(
+                this,
+                "Bir bölüm tanınmıyorsa (uygulamalar güncellenince olabilir): İncelemeyi başlat'a bas, Secure Lock'tan çık, 8 saniye içinde o uygulamayı aç ve bölüme gir. Ekranın içeriği kaydedilir. Sonra buraya dönüp göster, kopyala ve bana at.",
+                12f, UI.DIM
+            ),
+            UI.lp(this, 2)
+        )
+        col.addView(UI.button(this, "İncelemeyi başlat") {
+            Store.p(this).edit().putBoolean("dump_arm", true).apply()
+            toast("Hazır. Şimdi uygulamayı aç ve bölüme gir.")
+        }, UI.lp(this, 8))
+        col.addView(UI.button(this, "Son incelemeyi göster") { dumpDialog() }, UI.lp(this, 8))
+        show(v)
+    }
+
+    private fun addSectionFlow() {
+        inputDialog("Bölüm adı", "Örnek: TikTok Keşfet", "") { name ->
+            val apps = loadApps(false)
+            choose("Hangi uygulamanın bölümü?", apps.map { it.second }, -1) { i ->
+                inputDialog("Seçili sekme adı", "Ekranda alt sekmede görünen yazı", "") { word ->
+                    Sections.addCustom(this, name, apps[i].first, "sec:$word")
+                    sectionsScreen()
+                }
+            }
+        }
+    }
+
+    private fun dumpDialog() {
+        val txt = Store.p(this).getString("dump", "") ?: ""
+        val tv = TextView(this)
+        tv.text = if (txt.isEmpty()) "Henüz inceleme yok." else txt
+        tv.textSize = 11f
+        tv.setTextIsSelectable(true)
+        tv.setPadding(UI.dp(this, 16), UI.dp(this, 8), UI.dp(this, 16), UI.dp(this, 8))
+        val sv = ScrollView(this)
+        sv.addView(tv)
+        AlertDialog.Builder(this)
+            .setTitle("Son inceleme")
+            .setView(sv)
+            .setPositiveButton("Kopyala") { _, _ ->
+                val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("inceleme", txt))
+                toast("Kopyalandı")
+            }
+            .setNegativeButton("Kapat", null)
+            .show()
+    }
+
     // ---------- ozellestirme ----------
 
     private fun customScreen() {
+        pendingTv = null
         val back: () -> Unit = { customScreen() }
         val (v, col) = UI.page(this)
         hdr(col, "Özelleştirme") { home() }
         col.addView(
-            UI.tv(this, "Her satıra basılı tutarak o ayara ayrı mod ve zamanlayıcı koyabilirsin.", 12f, UI.DIM),
+            UI.tv(this, "Her satıra basılı tutarak o ayara ayrı seviye koyabilirsin.", 12f, UI.DIM),
             UI.lp(this, 4)
         )
 
@@ -1123,7 +1396,7 @@ class MainActivity : Activity() {
             }
         }, UI.lp(this, 6))
 
-        col.addView(UI.label(this, "Katı Mod engel ekranı"), UI.lp(this, 18))
+        col.addView(UI.label(this, "Katı engel ekranı"), UI.lp(this, 18))
         val secs = listOf(3, 5, 10, 15)
         col.addView(optRow(back, "gsec", "Geri sayım süresi", Store.ghostSecs(this).toString() + " saniye (3-2-1)") {
             choose("Geri sayım", secs.map { it.toString() + " saniye" }, maxOf(0, secs.indexOf(Store.ghostSecs(this)))) { i ->
@@ -1145,8 +1418,8 @@ class MainActivity : Activity() {
             }
         }, UI.lp(this, 6))
 
-        col.addView(UI.label(this, "Sıkı Mod engel ekranı"), UI.lp(this, 18))
-        val ss = listOf(3, 4, 6, 10)
+        col.addView(UI.label(this, "Sıkı engel ekranı"), UI.lp(this, 18))
+        val ss = listOf(3, 5, 8, 12)
         col.addView(optRow(back, "ssec", "Ekranda kalma süresi", Store.ssec(this).toString() + " saniye (kalan süre görünür)") {
             choose("Ekranda kalma süresi", ss.map { it.toString() + " saniye" }, maxOf(0, ss.indexOf(Store.ssec(this)))) { i ->
                 Store.setInt(this, "ssec", ss[i])
@@ -1192,7 +1465,7 @@ class MainActivity : Activity() {
             }
         }, UI.lp(this, 6))
         val ul = Clock.left(this, "unin")
-        if (ul > 0L && Policy.mode(this) == 0) {
+        if (ul > 0L && Policy.mode(this) == 0 && !Policy.katiProtect(this)) {
             col.addView(UI.tv(this, "Kaldırma izni açık, kalan: " + fmt(ul), 14f, green), UI.lp(this, 10))
             col.addView(optBtn(back, "unin_now", "Şimdi kaldır", color = UI.RED) {
                 confirm("Secure Lock kaldırılsın mı?", "Tüm korumalar ve ayarlar gider.") {
@@ -1206,7 +1479,9 @@ class MainActivity : Activity() {
         } else {
             col.addView(optBtn(back, "unin_give", "Kaldırma izni ver", color = UI.RED) {
                 if (Policy.mode(this) != 0) {
-                    toast("Oturum sürerken verilemez")
+                    toast("Sıkı Mod oturumu sürerken verilemez")
+                } else if (Policy.katiProtect(this)) {
+                    toast("Katı Koruma açıkken verilemez. Önce Katı Korumayı kaldır (24 saat bekleme).")
                 } else {
                     askSecret("Katı Mod şifresi") { s ->
                         if (Store.checkStrict(this, s)) {
@@ -1220,14 +1495,14 @@ class MainActivity : Activity() {
             }, UI.lp(this, 10))
         }
 
-        col.addView(UI.label(this, "Sıkı Mod özellikleri"), UI.lp(this, 18))
+        col.addView(UI.label(this, "Sıkı oturum özellikleri"), UI.lp(this, 18))
         for (t in Feat.siki) {
             col.addView(optSwitch(back, "f_" + t.first, t.second, Store.feat(this, t.first)) { on ->
                 Store.setFeat(this, t.first, on)
             }, UI.lp(this, 6))
         }
 
-        col.addView(UI.label(this, "Katı Mod özellikleri"), UI.lp(this, 18))
+        col.addView(UI.label(this, "Katı özellikleri"), UI.lp(this, 18))
         for (t in Feat.kati) {
             col.addView(optSwitch(back, "f_" + t.first, t.second, Store.feat(this, t.first)) { on ->
                 Store.setFeat(this, t.first, on)
@@ -1243,7 +1518,7 @@ class MainActivity : Activity() {
             if (on) {
                 confirm(
                     "Simge gizlensin mi?",
-                    "Simge ana menüden kalkar. Açmak için telefon uygulamasında *#*#7328#*#* tuşla. Önce kodun çalıştığından emin ol. Çalışmazsa Ayarlar > Erişilebilirlik > Secure Lock yolundan girersin.",
+                    "Simge ana menüden kalkar. Açmak için telefon uygulamasında *#*#7328#*#* tuşla. Önce kodun çalıştığından emin ol. Çalışmazsa Ayarlar > Erişilebilirlik > Yüklü uygulamalar > Secure Lock yolundan girersin. Samsung ana ekranı eski simgeyi bir süre gösterebilir, telefonu yeniden başlatınca kalkar.",
                     { h.post { customScreen() } }
                 ) {
                     Store.setFeat(this, "hide", true)
@@ -1260,6 +1535,7 @@ class MainActivity : Activity() {
     // ---------- sifreler ----------
 
     private fun passScreen() {
+        pendingTv = null
         val back: () -> Unit = { passScreen() }
         val (v, col) = UI.page(this)
         hdr(col, "Şifreler") { home() }
@@ -1295,6 +1571,7 @@ class MainActivity : Activity() {
     // ---------- istatistik ----------
 
     private fun statsScreen() {
+        pendingTv = null
         val (v, col) = UI.page(this)
         hdr(col, "İstatistik") { home() }
         col.addView(UI.tv(this, "Zincir: " + Store.streak(this) + " gün", 20f, UI.TXT, true), UI.lp(this, 8))
@@ -1315,7 +1592,44 @@ class MainActivity : Activity() {
 
     // ---------- kurulum ve izinler ----------
 
+    private fun adminDiag(): String {
+        return try {
+            val ris = packageManager.queryBroadcastReceivers(
+                Intent(DeviceAdminReceiver.ACTION_DEVICE_ADMIN_ENABLED), PackageManager.GET_META_DATA
+            )
+            val mine = ris.firstOrNull { it.activityInfo.packageName == packageName }
+            if (mine == null) {
+                "Sistem alıcıyı bulamadı (manifest sorunu)"
+            } else {
+                try {
+                    DeviceAdminInfo(this, mine)
+                    "Tanım geçerli"
+                } catch (e: Exception) {
+                    "Tanım geçersiz: " + e.message
+                }
+            }
+        } catch (e: Exception) {
+            "Kontrol edilemedi: " + e.message
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun adminRequest() {
+        grace = System.currentTimeMillis() + 180000
+        try {
+            startActivityForResult(
+                Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                    .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, Policy.admin(this))
+                    .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Secure Lock'un kaldırılmasını zorlaştırır."),
+                77
+            )
+        } catch (e: Exception) {
+            toast("Sistem ekranı açılamadı: " + e.message)
+        }
+    }
+
     private fun perms() {
+        pendingTv = null
         val (v, col) = UI.page(this)
         hdr(col, "Kurulum ve izinler") { home() }
         fun row(title: String, ok: Boolean, info: String, btn: String?, act: () -> Unit) {
@@ -1331,7 +1645,7 @@ class MainActivity : Activity() {
         }
         row(
             "Erişilebilirlik", accOn(),
-            "Tüm korumalar buna bağlı. Açılmazsa: Ayarlar > Uygulamalar > Secure Lock > sağ üst üç nokta > Kısıtlı ayarlara izin ver, sonra tekrar dene. Uygulamayı güncelledikten sonra bir kez kapatıp açman gerekebilir.",
+            "Tüm korumalar buna bağlı. Açılmazsa: Ayarlar > Uygulamalar > Secure Lock > sağ üst üç nokta > Kısıtlı ayarlara izin ver, sonra tekrar dene. Uygulamayı güncelledikten sonra bir kez kapatıp açman gerekir.",
             "Ayarları aç"
         ) { open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         val pmgr = getSystemService(POWER_SERVICE) as PowerManager
@@ -1339,16 +1653,10 @@ class MainActivity : Activity() {
             open(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
         }
         row(
-            "Cihaz yöneticisi (isteğe bağlı)", Policy.adminActive(this),
-            "Gerekmez. Katı Mod ve kaldırma koruması onsuz çalışır. Telefonda listede görünmüyorsa atla.",
-            "Dene"
-        ) {
-            open(
-                Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
-                    .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, Policy.admin(this))
-                    .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Ek kaldırma koruması")
-            )
-        }
+            "Cihaz yöneticisi", Policy.adminActive(this),
+            "Açıkken Kaldır dersen sistem \"devre dışı bırak ve kaldır\" uyarısı gösterir. Katı Koruma o uyarıyı da engeller.\nTeşhis: " + adminDiag(),
+            "Etkinleştir"
+        ) { adminRequest() }
         row(
             "Gri tonlama izni (isteğe bağlı)", Policy.canSecure(this),
             "Sadece gri tonlama için. Bugjaeger kabuğunda çalıştır:\npm grant com.securelock.app android.permission.WRITE_SECURE_SETTINGS",
@@ -1357,7 +1665,9 @@ class MainActivity : Activity() {
         if (Policy.adminActive(this)) {
             col.addView(UI.button(this, "Cihaz yöneticisini kapat") {
                 if (Policy.mode(this) != 0) {
-                    toast("Oturum sürerken kapatılamaz")
+                    toast("Sıkı Mod oturumu sürerken kapatılamaz")
+                } else if (Policy.katiProtect(this)) {
+                    toast("Katı Koruma açıkken kapatılamaz")
                 } else {
                     confirm("Cihaz yöneticisi kapatılsın mı?", "Ek kaldırma koruması gider.") {
                         try {
