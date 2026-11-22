@@ -55,14 +55,13 @@ class SecretReceiver : BroadcastReceiver() {
 
 object Feat {
     val siki = listOf(
-        Triple("s_acc", "Erişilebilirlik sayfaları engelli", true),
-        Triple("s_date", "Tarih ve saat ile Genel yönetim engelli", true),
-        Triple("s_lock", "Oturumda şifreler ve özelleştirme kilitli", true),
-        Triple("s_keep", "Oturumda listeden çıkarma yok", true)
+        Triple("s_acc", "Erişilebilirlik sayfaları engelli (Sıkı oturum ve Katı Koruma)", true),
+        Triple("s_date", "Tarih ve saat ile Genel yönetim engelli (Sıkı oturum ve Katı Koruma)", true),
+        Triple("s_lock", "Sıkı oturumda şifreler ve özelleştirme kilitli", true),
+        Triple("s_keep", "Sıkı oturumda listeden çıkarma yok", true)
     )
     val kati = listOf(
         Triple("k_admin", "Cihaz yöneticisi sayfası engelli", true),
-        Triple("k_enter", "Katı Mod'da Secure Lock'a girilebilsin", false),
         Triple("k_strike", "Sert ceza: en fazla 2 denemede ekran kilitlenir", true),
         Triple("k_allset", "Ayarlar uygulaması tamamen engelli", false)
     )
@@ -80,7 +79,7 @@ object Feat {
     }
 }
 
-// Telefonun kendi ayar sayfaları: başlığından tanınır, uygulamalar gibi modlara bağlanır
+// Telefonun kendi ayar sayfaları: başlığından tanınır
 object Pages {
     class Pg(val id: String, val name: String, tokens: List<String>) {
         val t: List<String> = tokens.map { norm(it) }
@@ -113,6 +112,57 @@ object Pages {
         Pg("about", "Telefon hakkında", listOf("telefon hakkında", "about phone")),
         Pg("vpn", "VPN", listOf("vpn"))
     )
+}
+
+// Uygulama içi bölümler (YouTube Shorts, Instagram Reels ...): uygulamanın tamamını değil sadece bölümü engeller
+// Kural satırları: id:kelime = ekrandaki bileşen adı, sec:kelime = seçili sekme, düz kelime = ekranda görünen yazı
+object Sections {
+    class Sec(val id: String, val name: String, val pkg: String, val defRules: String)
+
+    private val base = listOf(
+        Sec(
+            "yt", "YouTube Shorts", "com.google.android.youtube",
+            "id:reel_recycler\nid:reel_player_page_container\nid:reel_watch_fragment_root\nsec:shorts"
+        ),
+        Sec(
+            "ig", "Instagram Reels", "com.instagram.android",
+            "id:clips_viewer_view_pager\nid:clips_viewer_container\nsec:reels"
+        ),
+        Sec("fb", "Facebook Reels", "com.facebook.katana", "id:reels_viewer\nsec:reels")
+    )
+
+    fun isCustom(id: String) = id.startsWith("u")
+
+    fun all(c: Context): List<Sec> {
+        val out = ArrayList<Sec>(base)
+        val raw = Store.p(c).getString("cust", "") ?: ""
+        for (ln in raw.split("\n")) {
+            val f = ln.split("\t")
+            if (f.size >= 3 && f[0].isNotEmpty()) out.add(Sec(f[0], f[1], f[2], ""))
+        }
+        return out
+    }
+
+    fun rules(c: Context, s: Sec): String = Store.p(c).getString("sr_" + s.id, null) ?: s.defRules
+    fun setRules(c: Context, id: String, r: String) { Store.p(c).edit().putString("sr_$id", r).apply() }
+    fun resetRules(c: Context, id: String) { Store.p(c).edit().remove("sr_$id").apply() }
+
+    fun addCustom(c: Context, name: String, pkg: String, rules: String) {
+        val id = "u" + System.currentTimeMillis()
+        val clean = name.replace("\t", " ").replace("\n", " ").trim()
+        val raw = Store.p(c).getString("cust", "") ?: ""
+        val line = id + "\t" + clean + "\t" + pkg
+        Store.p(c).edit()
+            .putString("cust", if (raw.isEmpty()) line else raw + "\n" + line)
+            .putString("sr_$id", rules)
+            .apply()
+    }
+
+    fun removeCustom(c: Context, id: String) {
+        val raw = Store.p(c).getString("cust", "") ?: ""
+        val kept = raw.split("\n").filter { it.isNotEmpty() && !it.startsWith(id + "\t") }
+        Store.p(c).edit().putString("cust", kept.joinToString("\n")).remove("sr_$id").apply()
+    }
 }
 
 object Clock {
@@ -223,32 +273,70 @@ object Store {
     fun blocked(c: Context): Set<String> =
         HashSet<String>(p(c).getStringSet("blocked", emptySet()) ?: emptySet<String>())
 
-    // 1 = Normal kilit, 2 = Sıkı oturuma dahil, 4 = Katı oturuma dahil
-    // Anahtar: uygulama paketi, "pg:..." (telefon ayar sayfası) ya da "ui:..." (uygulama içi öğe)
+    // 1 = Normal kilit, 2 = Sıkı Mod oturumuna (ders programı) dahil
+    // Anahtar: uygulama paketi, "pg:..." (ayar sayfası), "sc:..." (uygulama içi bölüm), "ui:..." (uygulama içi düğme)
     fun tags(c: Context, pkg: String): Int {
         val s = p(c).getStringSet("blocked", null) ?: return 0
         if (!s.contains(pkg)) return 0
-        return p(c).getInt("tag_$pkg", 7)
+        return p(c).getInt("tag_$pkg", 3) and 3
     }
 
     fun setTags(c: Context, pkg: String, t: Int) {
+        val m = t and 3
         val s = HashSet<String>(blocked(c))
         val e = p(c).edit()
-        if (t == 0) {
+        if (m == 0) {
             s.remove(pkg)
             e.remove("tag_$pkg")
         } else {
             s.add(pkg)
-            e.putInt("tag_$pkg", t)
+            e.putInt("tag_$pkg", m)
         }
         e.putStringSet("blocked", s).apply()
     }
 
-    // Öğeye özel zamanlayıcılar: "is_<anahtar>" Sıkı, "ik_<anahtar>" Katı
-    fun timerLeft(c: Context, key: String): Long =
-        maxOf(Clock.left(c, "is_$key"), Clock.left(c, "ik_$key"))
+    // Sıkı: öğeye özel süreli blok
+    fun timerLeft(c: Context, key: String): Long = Clock.left(c, "is_$key")
 
-    fun lockedNow(c: Context, key: String): Boolean = tags(c, key) != 0 || timerLeft(c, key) > 0L
+    // Katı: kalıcı. Kaldırmak için Katı şifresi + 24 saat bekleme
+    fun katiSet(c: Context): Set<String> =
+        HashSet<String>(p(c).getStringSet("kati", emptySet()) ?: emptySet<String>())
+
+    fun setKati(c: Context, key: String, on: Boolean) {
+        val s = HashSet<String>(katiSet(c))
+        if (on) s.add(key) else s.remove(key)
+        p(c).edit().putStringSet("kati", s).remove("kxs_$key").apply()
+        Clock.clear(c, "kx_$key")
+    }
+
+    fun katiOn(c: Context, key: String): Boolean {
+        val s = p(c).getStringSet("kati", null) ?: return false
+        if (!s.contains(key)) return false
+        if (p(c).getBoolean("kxs_$key", false) && Clock.left(c, "kx_$key") <= 0L) {
+            setKati(c, key, false)
+            return false
+        }
+        return true
+    }
+
+    fun katiExitPending(c: Context, key: String): Boolean =
+        katiOn(c, key) && p(c).getBoolean("kxs_$key", false)
+
+    fun katiExitLeft(c: Context, key: String): Long = Clock.left(c, "kx_$key")
+
+    fun requestKatiExit(c: Context, key: String) {
+        p(c).edit().putBoolean("kxs_$key", true).apply()
+        Clock.clear(c, "kx_$key")
+        Clock.add(c, "kx_$key", 86400000L)
+    }
+
+    fun cancelKatiExit(c: Context, key: String) {
+        p(c).edit().remove("kxs_$key").apply()
+        Clock.clear(c, "kx_$key")
+    }
+
+    fun lockedNow(c: Context, key: String): Boolean =
+        katiOn(c, key) || tags(c, key) != 0 || timerLeft(c, key) > 0L
 
     fun feat(c: Context, k: String) = p(c).getBoolean("f_$k", Feat.def(k))
     fun setFeat(c: Context, k: String, v: Boolean) { p(c).edit().putBoolean("f_$k", v).apply() }
@@ -261,7 +349,7 @@ object Store {
     fun strikeN(c: Context) = p(c).getInt("strike", 3)
     fun relock(c: Context) = p(c).getInt("relock", 0)
     fun uninMin(c: Context) = p(c).getInt("unin_min", 10)
-    fun ssec(c: Context) = p(c).getInt("ssec", 4)
+    fun ssec(c: Context) = p(c).getInt("ssec", 5)
     fun backN(c: Context) = p(c).getInt("backn", 4)
     fun cover(c: Context) = p(c).getInt("cover", 0).coerceIn(0, 3)
     fun coverColor(c: Context): Int = Color.parseColor(coverHex[cover(c)])
@@ -314,10 +402,11 @@ object Policy {
 
     fun rawMode(c: Context) = Store.p(c).getInt("s_mode", 0)
 
+    // 0 = Normal, 1 = Sıkı oturum (ders programı)
     fun mode(c: Context): Int {
         if (rawMode(c) == 0) return 0
         refresh(c)
-        return rawMode(c)
+        return if (rawMode(c) != 0) 1 else 0
     }
 
     fun refresh(c: Context) {
@@ -326,9 +415,9 @@ object Policy {
 
     fun remaining(c: Context): Long = Clock.left(c, "sess")
 
-    fun start(c: Context, mode: Int, ms: Long) {
+    fun start(c: Context, ms: Long) {
         Clock.clear(c, "unin")
-        Store.p(c).edit().putInt("s_mode", mode).putLong("s_ms", ms).apply()
+        Store.p(c).edit().putInt("s_mode", 1).putLong("s_ms", ms).apply()
         Clock.clear(c, "sess")
         Clock.add(c, "sess", ms)
         setGray(c, true)
@@ -348,49 +437,46 @@ object Policy {
         }
     }
 
-    // Kaldırma izni penceresi: sadece oturum yokken ve süre içinde açıktır
-    fun uninstallOpen(c: Context): Boolean = mode(c) == 0 && Clock.left(c, "unin") > 0L
+    // Katı Koruma: kaldırma, cihaz yöneticisi, erişilebilirlik ve tarih sayfaları kalıcı engelli
+    fun katiProtect(c: Context): Boolean = Store.katiOn(c, "sys")
 
-    // Bir öğenin (uygulama, ayar sayfası ya da uygulama içi düğme) şu anki durumu
+    // Kaldırma izni penceresi: sadece oturum ve Katı Koruma yokken, süre içinde açıktır
+    fun uninstallOpen(c: Context): Boolean =
+        mode(c) == 0 && !katiProtect(c) && Clock.left(c, "unin") > 0L
+
+    // Bir öğenin (uygulama, ayar sayfası, bölüm, uygulama içi düğme) şu anki durumu
     fun blockInfo(c: Context, key: String): Blk {
-        val kk = Clock.left(c, "ik_$key")
+        if (Store.katiOn(c, key)) return Blk(3, 0L)
         val ks = Clock.left(c, "is_$key")
         val t = Store.tags(c, key)
         val m = mode(c)
-        val rem = if (m != 0) remaining(c) else 0L
         var kind = 0
         var left = 0L
-        if (kk > 0L) {
-            kind = 3
-            left = maxOf(left, kk)
-        }
-        if (m == 2 && (t and 6) != 0) {
-            kind = 3
-            left = maxOf(left, rem)
-        }
         if (ks > 0L) {
-            if (kind < 2) kind = 2
-            left = maxOf(left, ks)
+            kind = 2
+            left = ks
         }
         if (m == 1 && (t and 2) != 0) {
-            if (kind < 2) kind = 2
-            left = maxOf(left, rem)
+            kind = 2
+            left = maxOf(left, remaining(c))
         }
         if (kind == 0 && (t and 1) != 0) kind = 1
         return Blk(kind, left)
     }
 
-    // Telefon ayar sayfaları: hazır oturum kuralları + sayfaya konan modlar
+    // Telefon ayar sayfaları: hazır kurallar + sayfaya konan seviye
     fun pageInfo(c: Context, id: String): Blk {
         val b = blockInfo(c, "pg:$id")
+        if (b.kind == 3) return b
         val m = mode(c)
+        val kp = katiProtect(c)
         var forced = false
-        if (m >= 1 && Store.feat(c, "s_acc") && id == "acc") forced = true
-        if (m >= 1 && Store.feat(c, "s_date") && (id == "date" || id == "gm")) forced = true
-        if (m == 2 && Store.feat(c, "k_admin") && id == "admin") forced = true
+        if ((m >= 1 || kp) && Store.feat(c, "s_acc") && id == "acc") forced = true
+        if ((m >= 1 || kp) && Store.feat(c, "s_date") && (id == "date" || id == "gm")) forced = true
+        if (kp && Store.feat(c, "k_admin") && id == "admin") forced = true
         if (!forced) return b
-        val kind = if (m == 2) 3 else 2
-        return Blk(maxOf(kind, b.kind), maxOf(b.left, remaining(c)))
+        val left = if (m != 0) maxOf(b.left, remaining(c)) else b.left
+        return Blk(if (kp) 3 else 2, left)
     }
 
     fun secLocked(c: Context, id: String): Boolean {
