@@ -73,6 +73,7 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         UI.useTheme(this)
+        testResult()
         if (Store.isSetup(this) && selfBlockInfo() != null) {
             blockScreen()
         } else if (authed) {
@@ -307,7 +308,7 @@ class MainActivity : Activity() {
 
     private fun setup() {
         askText("Yönetici şifresi", "Uygulamaya her girişte sorulur. Kurtarma yöntemi yoktur, unutma.", false, 4, null) { admin ->
-            askText("Katı Mod şifresi", "Katı koyarken ve kaldırırken, Sıkı Mod başlatırken sorulur. Kurtarma yöntemi yoktur.", false, 4, null) { strict ->
+            askText("Katı Mod şifresi", "Katı koyarken ve kaldırırken, Sıkı Mod başlatırken, kaldırma izni verirken sorulur. Kurtarma yöntemi yoktur.", false, 4, null) { strict ->
                 pickLock(null) { t, s ->
                     Store.setAdmin(this, admin)
                     Store.setStrict(this, strict)
@@ -611,7 +612,7 @@ class MainActivity : Activity() {
         c.addView(UI.tv(this, info, 13f, UI.DIM), UI.lp(this, 4))
         if (!Policy.adminActive(this)) {
             c.addView(
-                UI.tv(this, "Cihaz yöneticisi kapalı. Katı Korumayı açmadan önce Kurulum ve izinler'den etkinleştirmen önerilir.", 12f, red),
+                UI.tv(this, "Cihaz yöneticisi kapalı. İstersen Kurulum ve izinler'den etkinleştir, ek koruma sağlar.", 12f, UI.DIM),
                 UI.lp(this, 6)
             )
         }
@@ -623,6 +624,95 @@ class MainActivity : Activity() {
             }, UI.lp(this, 10))
         }
         col.addView(c, UI.lp(this, 10))
+    }
+
+    // ---------- Kaldirma Engeli ----------
+
+    private fun uninText(): String {
+        val ul = Policy.ulockLeft(this)
+        val uo = Clock.left(this, "unin")
+        return when {
+            Policy.katiProtect(this) -> "Katı Koruma açık: kaldırma kapalı."
+            Policy.mode(this) != 0 -> "Sıkı Mod oturumu sürüyor: kaldırma kapalı."
+            ul > 0L -> "Kilitli: süre bitene kadar izin verilemez. Kalan: " + fmt(ul)
+            uo > 0L -> "Kaldırma izni AÇIK, kalan: " + fmt(uo)
+            else -> "Açık: Ayarlar'dan kaldırılamaz. Süre koyarsan süre dolana kadar izin de verilemez."
+        }
+    }
+
+    private fun uninCard(col: LinearLayout): TextView {
+        val c = UI.card(this)
+        c.addView(UI.tv(this, "Kaldırma Engeli", 17f, UI.TXT, true))
+        val st = UI.tv(this, uninText(), 13f, UI.DIM)
+        c.addView(st, UI.lp(this, 4))
+        c.addView(UI.button(this, "Süre koy (kilitle)") {
+            pickDuration("Kaldırma engeli süresi") { ms, txt ->
+                confirm("Geri dönüş yok", "Secure Lock $txt boyunca kaldırılamaz ve kaldırma izni verilemez. Kısaltılamaz. Devam edilsin mi?") {
+                    Store.setUninLock(this, ms)
+                    home()
+                }
+            }
+        }, UI.lp(this, 10))
+        val opened = Policy.uninstallOpen(this)
+        if (opened) {
+            c.addView(UI.button(this, "Şimdi kaldır", UI.RED) {
+                confirm("Secure Lock kaldırılsın mı?", "Tüm korumalar ve ayarlar gider.") {
+                    open(Intent(Intent.ACTION_DELETE, Uri.parse("package:$packageName")))
+                }
+            }, UI.lp(this, 8))
+            c.addView(UI.button(this, "Kaldırma iznini kapat") {
+                Clock.clear(this, "unin")
+                home()
+            }, UI.lp(this, 8))
+        } else {
+            c.addView(UI.button(this, "Kaldırmaya izin ver", UI.RED) {
+                when {
+                    Policy.mode(this) != 0 -> toast("Sıkı Mod oturumu sürerken verilemez")
+                    Policy.katiProtect(this) -> toast("Katı Koruma açıkken verilemez. Önce Katı Korumayı kaldır (24 saat bekleme).")
+                    Policy.ulockLeft(this) > 0L -> toast("Kilit sürüyor, izin verilemez. Kalan: " + fmt(Policy.ulockLeft(this)))
+                    else -> askSecret("Katı Mod şifresi") { s ->
+                        if (Store.checkStrict(this, s)) {
+                            Clock.add(this, "unin", Store.uninMin(this) * 60000L)
+                            home()
+                        } else {
+                            toast("Katı Mod şifresi yanlış")
+                        }
+                    }
+                }
+            }, UI.lp(this, 8))
+        }
+        c.addView(UI.button(this, "Korumayı dene") { protTest() }, UI.lp(this, 8))
+        c.addView(
+            UI.tv(this, "Korumayı dene: Ayarlar'daki Secure Lock sayfasını açar. Seni geri attıysa korumanın çalıştığını bu ekrana dönünce söylerim.", 12f, UI.DIM),
+            UI.lp(this, 6)
+        )
+        col.addView(c, UI.lp(this, 10))
+        return st
+    }
+
+    private fun protTest() {
+        if (!accOn()) {
+            toast("Erişilebilirlik izni kapalı: koruma çalışmaz")
+            return
+        }
+        if (Policy.uninstallOpen(this)) {
+            toast("Kaldırma izni açık, koruma kapalı. Önce izni kapat.")
+            return
+        }
+        Store.p(this).edit().putLong("test_at", System.currentTimeMillis()).apply()
+        open(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+    }
+
+    private fun testResult() {
+        val ta = Store.p(this).getLong("test_at", 0L)
+        if (ta == 0L) return
+        Store.p(this).edit().remove("test_at").apply()
+        if (System.currentTimeMillis() - ta > 600000L) return
+        val lg = Store.p(this).getLong("last_guard", 0L)
+        toast(
+            if (lg >= ta) "Koruma çalışıyor: Ayarlar sayfasından geri atıldın."
+            else "Koruma ÇALIŞMADI: sayfa açık kaldı. Ekran görüntüsünü at."
+        )
     }
 
     // ---------- ogeye ozel seviye ----------
@@ -911,6 +1001,7 @@ class MainActivity : Activity() {
             col.addView(optBtn(back, "siki", "Sıkı Mod başlat", color = UI.ACC) { sessionScreen() }, UI.lp(this, 14))
         }
         katiCard(col)
+        val uninTv = uninCard(col)
         val appN = Store.blocked(this).count {
             !it.startsWith("pg:") && !it.startsWith("ui:") && !it.startsWith("sc:")
         }
@@ -957,6 +1048,7 @@ class MainActivity : Activity() {
                     sub.text = "Kalan süre: " + fmt(Policy.remaining(this@MainActivity)) +
                         "\nSüre bitene kadar geri dönüş yok."
                 }
+                uninTv.text = uninText()
                 h.postDelayed(this, 1000)
             }
         }
@@ -987,8 +1079,12 @@ class MainActivity : Activity() {
             "Süre yok, şifreyle açılmaz. Engel ekranında 3-2-1 geri sayım olur ve ceza sert (2 denemede ekran kilitlenir). Kaldırmak için Katı şifresi ve 24 saat bekleme gerekir, o arada vazgeçebilirsin."
         )
         block(
+            "Kaldırma Engeli",
+            "Secure Lock'un Ayarlar'dan kaldırılmasını engeller: Ayarlar'daki bilgi sayfası açılır açılmaz kapanır, simgeye basılı tutunca Kaldır menüsü yerine blok ekranı çıkar. Süre koyarsan süre dolana kadar kaldırma izni de verilemez. Süre bitince kendiliğinden açılmaz: uygulamaya girip \"Kaldırmaya izin ver\" dersin."
+        )
+        block(
             "Katı Koruma",
-            "Secure Lock'un kendisini korur: Ayarlar'da bilgi sayfası ve kaldırma engellenir, Erişilebilirlik, Tarih ve saat ile Cihaz yöneticisi sayfalarına girilemez."
+            "Kaldırma Engeli'nin kalıcı hâli. Ek olarak Erişilebilirlik, Tarih ve saat ile Cihaz yöneticisi sayfalarına girilemez."
         )
         block(
             "Uygulama içi bölümler",
@@ -1452,6 +1548,10 @@ class MainActivity : Activity() {
         }, UI.lp(this, 6))
 
         col.addView(UI.label(this, "Koruma (kaldırma engeli)"), UI.lp(this, 18))
+        col.addView(
+            UI.tv(this, "Kaldırma kilidi, Katı Koruma ya da Sıkı oturum sürerken bu anahtarlar kapalı olsa da koruma açık kalır. Kaldırma iznini ve kilidi ana ekrandaki Kaldırma Engeli kartından yönetirsin.", 12f, UI.DIM),
+            UI.lp(this, 4)
+        )
         for (t in Feat.prot) {
             col.addView(optSwitch(back, "f_" + t.first, t.second, Store.feat(this, t.first)) { on ->
                 Store.setFeat(this, t.first, on)
@@ -1464,36 +1564,6 @@ class MainActivity : Activity() {
                 customScreen()
             }
         }, UI.lp(this, 6))
-        val ul = Clock.left(this, "unin")
-        if (ul > 0L && Policy.mode(this) == 0 && !Policy.katiProtect(this)) {
-            col.addView(UI.tv(this, "Kaldırma izni açık, kalan: " + fmt(ul), 14f, green), UI.lp(this, 10))
-            col.addView(optBtn(back, "unin_now", "Şimdi kaldır", color = UI.RED) {
-                confirm("Secure Lock kaldırılsın mı?", "Tüm korumalar ve ayarlar gider.") {
-                    open(Intent(Intent.ACTION_DELETE, Uri.parse("package:$packageName")))
-                }
-            }, UI.lp(this, 8))
-            col.addView(optBtn(back, "unin_off", "Kaldırma iznini kapat") {
-                Clock.clear(this, "unin")
-                customScreen()
-            }, UI.lp(this, 8))
-        } else {
-            col.addView(optBtn(back, "unin_give", "Kaldırma izni ver", color = UI.RED) {
-                if (Policy.mode(this) != 0) {
-                    toast("Sıkı Mod oturumu sürerken verilemez")
-                } else if (Policy.katiProtect(this)) {
-                    toast("Katı Koruma açıkken verilemez. Önce Katı Korumayı kaldır (24 saat bekleme).")
-                } else {
-                    askSecret("Katı Mod şifresi") { s ->
-                        if (Store.checkStrict(this, s)) {
-                            Clock.add(this, "unin", Store.uninMin(this) * 60000L)
-                            customScreen()
-                        } else {
-                            toast("Katı Mod şifresi yanlış")
-                        }
-                    }
-                }
-            }, UI.lp(this, 10))
-        }
 
         col.addView(UI.label(this, "Sıkı oturum özellikleri"), UI.lp(this, 18))
         for (t in Feat.siki) {
@@ -1645,7 +1715,7 @@ class MainActivity : Activity() {
         }
         row(
             "Erişilebilirlik", accOn(),
-            "Tüm korumalar buna bağlı. Açılmazsa: Ayarlar > Uygulamalar > Secure Lock > sağ üst üç nokta > Kısıtlı ayarlara izin ver, sonra tekrar dene. Uygulamayı güncelledikten sonra bir kez kapatıp açman gerekir.",
+            "Tüm korumalar buna bağlı. Açılmazsa: Ayarlar > Uygulamalar > Secure Lock > sağ üst üç nokta > Kısıtlı ayarlara izin ver, sonra tekrar dene. Not: Kaldırma Engeli açıkken bu sayfaya girmek için önce ana ekrandan Kaldırmaya izin ver de. Uygulamayı güncelledikten sonra bir kez kapatıp açman gerekir.",
             "Ayarları aç"
         ) { open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         val pmgr = getSystemService(POWER_SERVICE) as PowerManager
@@ -1653,8 +1723,8 @@ class MainActivity : Activity() {
             open(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
         }
         row(
-            "Cihaz yöneticisi", Policy.adminActive(this),
-            "Açıkken Kaldır dersen sistem \"devre dışı bırak ve kaldır\" uyarısı gösterir. Katı Koruma o uyarıyı da engeller.\nTeşhis: " + adminDiag(),
+            "Cihaz yöneticisi (isteğe bağlı)", Policy.adminActive(this),
+            "Açıkken Kaldır dersen sistem \"devre dışı bırak ve kaldır\" uyarısı gösterir. Kaldırma Engeli o uyarıyı da yakalar.\nTeşhis: " + adminDiag(),
             "Etkinleştir"
         ) { adminRequest() }
         row(
