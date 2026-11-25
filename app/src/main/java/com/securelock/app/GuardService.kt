@@ -32,7 +32,8 @@ class GuardService : AccessibilityService() {
     companion object {
         var inst: GuardService? = null
         private val INFO_W = listOf(
-            "kaldır", "zorla durdur", "uninstall", "force stop", "devre dışı bırak", "disable"
+            "kaldır", "zorla durdur", "durmaya zorla", "uninstall", "force stop",
+            "devre dışı bırak", "disable", "uygulama bilgileri", "app info"
         ).map { norm(it) }
         private val ADMIN_W = listOf(
             "cihaz yönet", "device admin", "devre dışı bırak ve kaldır", "deactivate"
@@ -145,10 +146,14 @@ class GuardService : AccessibilityService() {
     private fun guardable(pkg: String) = pkg.contains("settings") || pkg.contains("packageinstaller")
 
     private fun watching(): Boolean =
-        Policy.rawMode(this) != 0 || Policy.katiProtect(this) ||
-            Store.feat(this, "p_info") || Store.feat(this, "p_uninst") ||
+        Policy.rawMode(this) != 0 || Policy.katiProtect(this) || Policy.ulockLeft(this) > 0L ||
+            Store.feat(this, "p_info") || Store.feat(this, "p_uninst") || Store.feat(this, "p_split") ||
             Store.blocked(this).any { it.startsWith("pg:") } ||
             Pages.all.any { Store.timerLeft(this, "pg:" + it.id) > 0L || Store.katiOn(this, "pg:" + it.id) }
+
+    private fun noteGuard() {
+        Store.p(this).edit().putLong("last_guard", System.currentTimeMillis()).apply()
+    }
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         if (e == null) return
@@ -244,7 +249,7 @@ class GuardService : AccessibilityService() {
     // Ana ekranda Secure Lock simgesine basılı tutulursa Kaldır menüsü yerine blok ekranı
     private fun longClick(e: AccessibilityEvent, pkg: String) {
         if (busy || Policy.uninstallOpen(this)) return
-        if (!Store.feat(this, "p_launch") && !Policy.katiProtect(this)) return
+        if (!Policy.protOn(this, "p_launch")) return
         cache()
         if (!launchSet.contains(pkg)) return
         val sb = StringBuilder()
@@ -268,17 +273,75 @@ class GuardService : AccessibilityService() {
         if (!busy && current == pkg && watching()) pageGuard(pkg)
     }
 
+    // ---------- pencere okuma (bolunmus ekranda dogru pencereyi bulur) ----------
+
+    private fun rootFor(pkg: String): AccessibilityNodeInfo? {
+        try {
+            val ws = windows
+            if (ws != null) {
+                for (w in ws) {
+                    val r = w.root ?: continue
+                    if (r.packageName?.toString() == pkg) return r
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return try {
+            val r = rootInActiveWindow
+            if (r != null && r.packageName?.toString() == pkg) r else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // Paketin tüm pencerelerinin (sayfa + açılan pencereler) yazılarını toplar
+    private fun textsFor(pkg: String): List<String> {
+        val out = ArrayList<String>()
+        try {
+            val ws = windows
+            if (ws != null) {
+                for (w in ws) {
+                    val r = w.root ?: continue
+                    if (r.packageName?.toString() == pkg) collect(r, out, 0)
+                }
+            }
+            if (out.isEmpty()) {
+                val r = rootInActiveWindow
+                if (r != null && r.packageName?.toString() == pkg) collect(r, out, 0)
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    // O paketin penceresi tam ekran değilse true
+    @Suppress("DEPRECATION")
+    private fun windowPartial(pkg: String): Boolean {
+        try {
+            val ws = windows ?: return false
+            val dm = DisplayMetrics()
+            wm?.defaultDisplay?.getRealMetrics(dm)
+            val sw = dm.widthPixels
+            val sh = dm.heightPixels
+            if (sw <= 0 || sh <= 0) return false
+            val r = Rect()
+            for (w in ws) {
+                val root = w.root ?: continue
+                if (root.packageName?.toString() != pkg) continue
+                w.getBoundsInScreen(r)
+                if (!(r.width() >= sw * 0.9 && r.height() >= sh * 0.85)) return true
+            }
+        } catch (e: Exception) {
+        }
+        return false
+    }
+
     // ---------- uygulama ici bolumler (Shorts, Reels ...) ----------
 
     private fun sectionGuard(pkg: String): Boolean {
         val list = sections().filter { it.pkg == pkg }
         if (list.isEmpty()) return false
-        val root = try {
-            rootInActiveWindow
-        } catch (e: Exception) {
-            null
-        } ?: return false
-        if (root.packageName?.toString() != pkg) return false
+        val root = rootFor(pkg) ?: return false
         for (s in list) {
             val key = "sc:" + s.id
             val b = Policy.blockInfo(this, key)
@@ -297,12 +360,7 @@ class GuardService : AccessibilityService() {
     }
 
     private fun sectionStillOn(s: Sections.Sec): Boolean {
-        val root = try {
-            rootInActiveWindow
-        } catch (e: Exception) {
-            null
-        } ?: return false
-        if (root.packageName?.toString() != s.pkg) return false
+        val root = rootFor(s.pkg) ?: return false
         return matchRules(root, Sections.rules(this, s))
     }
 
@@ -367,7 +425,7 @@ class GuardService : AccessibilityService() {
         val sb = StringBuilder()
         sb.append("Paket: ").append(pkg).append("\n")
         try {
-            val root = rootInActiveWindow
+            val root = rootFor(pkg) ?: rootInActiveWindow
             if (root != null) {
                 dumpNode(root, sb, intArrayOf(0), 0)
             } else {
@@ -401,41 +459,60 @@ class GuardService : AccessibilityService() {
         for (i in 0 until n.childCount) dumpNode(n.getChild(i), sb, cnt, d + 1)
     }
 
-    // ---------- ayarlar sayfalari ----------
+    // ---------- ayarlar sayfalari ve kaldirma korumasi ----------
 
     private fun pageGuard(pkg: String): Boolean {
         val mode = Policy.mode(this)
         val kp = Policy.katiProtect(this)
         if (kp && Store.feat(this, "k_allset") && pkg == "com.android.settings") {
-            kick("Ayarlar kilitli")
+            kick("Ayarlar kilitli", pkg)
             return true
         }
-        val t = pageTexts(pkg)
+        // Ayarlar bölünmüş ekranın bir yarısındaysa kapat
+        if (pkg == "com.android.settings" && Policy.protOn(this, "p_split") && isSplit() && windowPartial(pkg)) {
+            kick("Ayarlar bölünmüş ekranda açılamaz", pkg)
+            return true
+        }
+        val t = textsFor(pkg)
         if (t.isEmpty()) return false
         val open = Policy.uninstallOpen(this)
-        val ours = t.any { it.contains("secure lock") }
+        val oursAny = t.any { it.contains("secure lock") }
+        val oursExact = t.any { it == "secure lock" }
+
+        // Kaldırma onay penceresi ("Bu uygulamanın yüklemesini kaldırmak istiyor musunuz?")
+        val dlg = t.any { it.contains("kaldirmak istiyor") || it.contains("want to uninstall") }
+        if (!open && oursAny && dlg && Policy.protOn(this, "p_uninst")) {
+            noteGuard()
+            kick("Kaldırma engelli", pkg)
+            return true
+        }
 
         if (pkg.contains("packageinstaller")) {
             val uninstall = t.any { it.contains("kaldir") || it.contains("uninstall") }
-            if (!open && ours && uninstall && (kp || Store.feat(this, "p_uninst"))) {
-                kick("Kaldırma engelli")
+            if (!open && oursAny && uninstall && Policy.protOn(this, "p_uninst")) {
+                noteGuard()
+                kick("Kaldırma engelli", pkg)
                 return true
             }
             return false
         }
 
         // "Devre dışı bırak ve kaldır" gibi cihaz yöneticisi pencereleri
-        if (!open && kp && ours && Policy.adminActive(this) &&
+        if (!open && oursAny && Policy.adminActive(this) && Policy.protOn(this, "p_uninst") &&
             t.any { s -> ADMIN_W.any { w -> s.contains(w) } }
         ) {
-            kick("Kaldırma engelli")
+            noteGuard()
+            kick("Kaldırma engelli", pkg)
             return true
         }
 
-        if (t.take(12).any { it == "secure lock" }) {
+        // Ayarlar > Uygulamalar > Secure Lock bilgi sayfası
+        if (oursExact) {
+            val head = t.take(14).any { it == "secure lock" }
             val info = t.any { INFO_W.contains(it) }
-            if (!open && (kp || mode != 0 || (info && Store.feat(this, "p_info")))) {
-                kick("Secure Lock korumalı")
+            if (!open && ((head && (kp || mode != 0)) || (info && Policy.protOn(this, "p_info")))) {
+                noteGuard()
+                kick("Secure Lock korumalı", pkg)
                 return true
             }
         }
@@ -456,17 +533,6 @@ class GuardService : AccessibilityService() {
             }
         }
         return false
-    }
-
-    private fun pageTexts(pkg: String): List<String> {
-        val out = ArrayList<String>()
-        try {
-            val root = rootInActiveWindow ?: return out
-            if (root.packageName?.toString() != pkg) return out
-            collect(root, out, 0)
-        } catch (e: Exception) {
-        }
-        return out
     }
 
     private fun collect(n: AccessibilityNodeInfo?, out: ArrayList<String>, d: Int) {
@@ -532,7 +598,8 @@ class GuardService : AccessibilityService() {
         h.postDelayed({ if (sectionStillOn(s)) leave() }, 1000)
     }
 
-    private fun kick(msg: String) {
+    // Korumalı sayfa ya da pencereden at: Geri zinciri + Ana ekran, istenirse o uygulamanın işlemini kapat
+    private fun kick(msg: String, killPkg: String? = null) {
         if (busy) return
         val now = System.currentTimeMillis()
         if (now - lastKick < 800) return
@@ -542,6 +609,10 @@ class GuardService : AccessibilityService() {
         buzz()
         showCover("Korumalı", msg, "", 0, Store.randomLine(this))
         leave()
+        if (killPkg != null) {
+            h.postDelayed({ kill(killPkg) }, 800)
+            h.postDelayed({ kill(killPkg) }, 1600)
+        }
         h.postDelayed({
             hideCover()
             busy = false
