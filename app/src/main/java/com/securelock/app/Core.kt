@@ -68,7 +68,8 @@ object Feat {
     val prot = listOf(
         Triple("p_info", "Ayarlar'da Secure Lock bilgi sayfası engelli (Kaldır görünmez)", true),
         Triple("p_uninst", "Kaldırma penceresi engelli", true),
-        Triple("p_launch", "Ana ekranda simgeye basılı tutunca blok ekranı", true)
+        Triple("p_launch", "Ana ekranda simgeye basılı tutunca blok ekranı", true),
+        Triple("p_split", "Ayarlar bölünmüş ekranda açılamasın", true)
     )
 
     fun def(k: String): Boolean {
@@ -338,6 +339,12 @@ object Store {
     fun lockedNow(c: Context, key: String): Boolean =
         katiOn(c, key) || tags(c, key) != 0 || timerLeft(c, key) > 0L
 
+    // Kaldırma kilidi: süre dolana kadar kaldırma izni verilemez, kısaltılamaz
+    fun setUninLock(c: Context, ms: Long) {
+        Clock.add(c, "ulock", ms)
+        Clock.clear(c, "unin")
+    }
+
     fun feat(c: Context, k: String) = p(c).getBoolean("f_$k", Feat.def(k))
     fun setFeat(c: Context, k: String, v: Boolean) { p(c).edit().putBoolean("f_$k", v).apply() }
     fun setInt(c: Context, k: String, v: Int) { p(c).edit().putInt(k, v).apply() }
@@ -440,9 +447,15 @@ object Policy {
     // Katı Koruma: kaldırma, cihaz yöneticisi, erişilebilirlik ve tarih sayfaları kalıcı engelli
     fun katiProtect(c: Context): Boolean = Store.katiOn(c, "sys")
 
-    // Kaldırma izni penceresi: sadece oturum ve Katı Koruma yokken, süre içinde açıktır
+    fun ulockLeft(c: Context): Long = Clock.left(c, "ulock")
+
+    // Koruma anahtarı kapalı olsa bile: kilit, Katı Koruma ya da Sıkı oturum sürerken koruma açıktır
+    fun protOn(c: Context, k: String): Boolean =
+        Store.feat(c, k) || katiProtect(c) || ulockLeft(c) > 0L || mode(c) != 0
+
+    // Kaldırma izni penceresi: sadece oturum, Katı Koruma ve kilit yokken, süre içinde açıktır
     fun uninstallOpen(c: Context): Boolean =
-        mode(c) == 0 && !katiProtect(c) && Clock.left(c, "unin") > 0L
+        mode(c) == 0 && !katiProtect(c) && ulockLeft(c) <= 0L && Clock.left(c, "unin") > 0L
 
     // Bir öğenin (uygulama, ayar sayfası, bölüm, uygulama içi düğme) şu anki durumu
     fun blockInfo(c: Context, key: String): Blk {
