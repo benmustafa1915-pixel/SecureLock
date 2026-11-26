@@ -33,7 +33,15 @@ class GuardService : AccessibilityService() {
         var inst: GuardService? = null
         private val INFO_W = listOf(
             "kaldır", "zorla durdur", "durmaya zorla", "uninstall", "force stop",
-            "devre dışı bırak", "disable", "uygulama bilgileri", "app info"
+            "devre dışı bırak", "disable", "uygulama bilgileri", "app info",
+            "verileri sil", "verileri temizle", "clear data", "clear storage", "depolamayı temizle"
+        ).map { norm(it) }
+        private val BTN_W = listOf(
+            "kaldır", "durmaya zorla", "zorla durdur", "devre dışı bırak", "d. dışı bırak",
+            "uninstall", "force stop", "disable"
+        ).map { norm(it) }
+        private val CLEAR_W = listOf(
+            "verileri sil", "verileri temizle", "clear data", "delete app data", "depolamayı temizle"
         ).map { norm(it) }
         private val ADMIN_W = listOf(
             "cihaz yönet", "device admin", "devre dışı bırak ve kaldır", "deactivate"
@@ -64,6 +72,13 @@ class GuardService : AccessibilityService() {
     private val unlockAt = HashMap<String, Long>()
     private val strikes = ArrayList<Long>()
 
+    // Gri örtüler (Kaldır, Durmaya zorla ... düğmelerinin üstü)
+    private val masks = ArrayList<FrameLayout>()
+    private var maskSig = ""
+    private var maskRoot: AccessibilityNodeInfo? = null
+    private var maskPkg = ""
+    private var maskLoopOn = false
+
     private val screenOff = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (Store.relock(this@GuardService) <= 0) unlockAt.clear()
@@ -75,6 +90,41 @@ class GuardService : AccessibilityService() {
         override fun run() {
             Policy.refresh(this@GuardService)
             h.postDelayed(this, 15000)
+        }
+    }
+
+    // Sayfa hâlâ görünüyorsa örtüleri tazeler, görünmüyorsa kaldırır
+    private val maskLoop = object : Runnable {
+        override fun run() {
+            var again = false
+            try {
+                if (!Policy.uninstallOpen(this@GuardService)) {
+                    val roots = ArrayList<AccessibilityNodeInfo>()
+                    val mr = maskRoot
+                    if (mr != null && mr.refresh()) roots.add(mr)
+                    for (r in rootsFor(maskPkg, null)) roots.add(r)
+                    val rects = ArrayList<Pair<Rect, String>>()
+                    var ours = false
+                    for (r in roots) {
+                        if (isOurPage(r)) {
+                            ours = true
+                            findButtons(r, rects, 0)
+                        }
+                    }
+                    if (ours && rects.isNotEmpty()) {
+                        setMasks(rects)
+                        again = true
+                    }
+                }
+            } catch (x: Exception) {
+            }
+            if (again) {
+                h.postDelayed(this, 450)
+            } else {
+                clearMasks()
+                maskLoopOn = false
+                maskRoot = null
+            }
         }
     }
 
@@ -95,6 +145,8 @@ class GuardService : AccessibilityService() {
         super.onDestroy()
         inst = null
         h.removeCallbacksAndMessages(null)
+        clearMasks()
+        maskLoopOn = false
         hideCover()
         if (registered) {
             try { unregisterReceiver(screenOff) } catch (e: Exception) {}
@@ -209,11 +261,17 @@ class GuardService : AccessibilityService() {
             }
             if (guardable(pkg) && watching() && now - lastScan > 250) {
                 lastScan = now
-                pageGuard(pkg)
+                pageGuard(pkg, e)
             }
             return
         }
 
+        // Ayarlar sayfaları ana ekran kontrolünden ÖNCE bakılır (bazı telefonlarda Ayarlar ana ekran adayı sayılıyor)
+        if (guardable(pkg) && watching()) {
+            if (pageGuard(pkg, e)) return
+            h.postDelayed({ recheck(pkg) }, 400)
+            h.postDelayed({ recheck(pkg) }, 1200)
+        }
         if (launchSet.contains(pkg)) {
             if (Store.relock(this) == 0) unlockAt.clear()
             current = ""
@@ -227,11 +285,6 @@ class GuardService : AccessibilityService() {
                 clearPrefix("sc:")
             }
             current = pkg
-        }
-        if (guardable(pkg) && watching()) {
-            if (pageGuard(pkg)) return
-            h.postDelayed({ recheck(pkg) }, 400)
-            h.postDelayed({ recheck(pkg) }, 1200)
         }
         val b = Policy.blockInfo(this, pkg)
         if (b.kind >= 2) {
@@ -270,49 +323,57 @@ class GuardService : AccessibilityService() {
     }
 
     private fun recheck(pkg: String) {
-        if (!busy && current == pkg && watching()) pageGuard(pkg)
+        if (!busy && watching()) pageGuard(pkg, null)
     }
 
     // ---------- pencere okuma (bolunmus ekranda dogru pencereyi bulur) ----------
 
-    private fun rootFor(pkg: String): AccessibilityNodeInfo? {
+    // Olayı gönderen pencerenin kökü: "seçili pencere" hangisi olursa olsun doğru pencereyi verir
+    private fun rootOf(e: AccessibilityEvent): AccessibilityNodeInfo? {
         try {
-            val ws = windows
-            if (ws != null) {
-                for (w in ws) {
-                    val r = w.root ?: continue
-                    if (r.packageName?.toString() == pkg) return r
-                }
+            var n: AccessibilityNodeInfo = e.source ?: return null
+            var i = 0
+            while (i < 80) {
+                val p = n.parent ?: break
+                n = p
+                i++
             }
-        } catch (e: Exception) {
-        }
-        return try {
-            val r = rootInActiveWindow
-            if (r != null && r.packageName?.toString() == pkg) r else null
-        } catch (e: Exception) {
-            null
+            return n
+        } catch (x: Exception) {
+            return null
         }
     }
 
-    // Paketin tüm pencerelerinin (sayfa + açılan pencereler) yazılarını toplar
-    private fun textsFor(pkg: String): List<String> {
-        val out = ArrayList<String>()
+    // Paketin tüm pencereleri: olayın penceresi + pencere listesi + seçili pencere
+    private fun rootsFor(pkg: String, e: AccessibilityEvent?): List<AccessibilityNodeInfo> {
+        val out = ArrayList<AccessibilityNodeInfo>()
+        val seen = HashSet<Int>()
+        fun add(r: AccessibilityNodeInfo?) {
+            if (r == null) return
+            try {
+                if (r.packageName?.toString() != pkg) return
+                if (seen.add(r.windowId)) out.add(r)
+            } catch (x: Exception) {
+            }
+        }
+        if (e != null) add(rootOf(e))
         try {
             val ws = windows
             if (ws != null) {
-                for (w in ws) {
-                    val r = w.root ?: continue
-                    if (r.packageName?.toString() == pkg) collect(r, out, 0)
-                }
+                for (w in ws) add(w.root)
             }
-            if (out.isEmpty()) {
-                val r = rootInActiveWindow
-                if (r != null && r.packageName?.toString() == pkg) collect(r, out, 0)
+        } catch (x: Exception) {
+        }
+        if (out.isEmpty()) {
+            try {
+                add(rootInActiveWindow)
+            } catch (x: Exception) {
             }
-        } catch (e: Exception) {
         }
         return out
     }
+
+    private fun rootFor(pkg: String): AccessibilityNodeInfo? = rootsFor(pkg, null).firstOrNull()
 
     // O paketin penceresi tam ekran değilse true
     @Suppress("DEPRECATION")
@@ -334,6 +395,106 @@ class GuardService : AccessibilityService() {
         } catch (e: Exception) {
         }
         return false
+    }
+
+    // ---------- gri orttu (Kaldir, Durmaya zorla ... dugmeleri) ----------
+
+    private fun isOurPage(r: AccessibilityNodeInfo): Boolean {
+        val t = ArrayList<String>()
+        collect(r, t, 0)
+        return t.any { it == "secure lock" } && t.any { INFO_W.contains(it) }
+    }
+
+    private fun clickBounds(n: AccessibilityNodeInfo): Rect {
+        var p: AccessibilityNodeInfo = n
+        var i = 0
+        while (i < 6 && !p.isClickable) {
+            val par = p.parent ?: break
+            p = par
+            i++
+        }
+        val r = Rect()
+        if (p.isClickable) {
+            p.getBoundsInScreen(r)
+        } else {
+            n.getBoundsInScreen(r)
+            r.inset(-UI.dp(this, 28), -UI.dp(this, 28))
+        }
+        return r
+    }
+
+    private fun findButtons(n: AccessibilityNodeInfo?, out: ArrayList<Pair<Rect, String>>, d: Int) {
+        if (n == null || out.size >= 8 || d > 30) return
+        try {
+            if (n.isVisibleToUser) {
+                val tx = n.text?.toString() ?: ""
+                val cd = n.contentDescription?.toString() ?: ""
+                val lab = if (tx.isNotEmpty()) tx else cd
+                if (lab.isNotEmpty() && BTN_W.contains(norm(lab))) {
+                    out.add(Pair(clickBounds(n), lab))
+                }
+            }
+        } catch (x: Exception) {
+        }
+        for (i in 0 until n.childCount) findButtons(n.getChild(i), out, d + 1)
+    }
+
+    private fun setMasks(rects: List<Pair<Rect, String>>) {
+        val uniq = LinkedHashMap<String, Pair<Rect, String>>()
+        for (p in rects) uniq[p.first.flattenToString()] = p
+        val sig = uniq.keys.joinToString("|")
+        if (sig == maskSig && masks.isNotEmpty()) return
+        clearMasks()
+        maskSig = sig
+        val w = wm ?: return
+        for (p in uniq.values) {
+            val r = p.first
+            if (r.width() <= 0 || r.height() <= 0) continue
+            val fl = FrameLayout(this)
+            fl.setBackgroundColor(Color.BLACK)
+            val tv = TextView(this)
+            tv.text = p.second
+            tv.setTextColor(Color.parseColor("#5A5A5A"))
+            tv.textSize = 15f
+            tv.gravity = Gravity.CENTER
+            fl.addView(tv, FrameLayout.LayoutParams(-1, -1))
+            val lp = WindowManager.LayoutParams(
+                r.width(), r.height(),
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.OPAQUE
+            )
+            lp.gravity = Gravity.TOP or Gravity.START
+            lp.x = r.left
+            lp.y = r.top
+            try {
+                w.addView(fl, lp)
+                masks.add(fl)
+            } catch (x: Exception) {
+            }
+        }
+    }
+
+    private fun clearMasks() {
+        for (m in masks) {
+            try {
+                wm?.removeView(m)
+            } catch (x: Exception) {
+            }
+        }
+        masks.clear()
+        maskSig = ""
+    }
+
+    private fun startMask(pkg: String, roots: List<AccessibilityNodeInfo>) {
+        maskPkg = pkg
+        if (roots.isNotEmpty()) maskRoot = roots[0]
+        if (!maskLoopOn) {
+            maskLoopOn = true
+            maskLoop.run()
+        }
     }
 
     // ---------- uygulama ici bolumler (Shorts, Reels ...) ----------
@@ -461,7 +622,7 @@ class GuardService : AccessibilityService() {
 
     // ---------- ayarlar sayfalari ve kaldirma korumasi ----------
 
-    private fun pageGuard(pkg: String): Boolean {
+    private fun pageGuard(pkg: String, e: AccessibilityEvent?): Boolean {
         val mode = Policy.mode(this)
         val kp = Policy.katiProtect(this)
         if (kp && Store.feat(this, "k_allset") && pkg == "com.android.settings") {
@@ -473,7 +634,14 @@ class GuardService : AccessibilityService() {
             kick("Ayarlar bölünmüş ekranda açılamaz", pkg)
             return true
         }
-        val t = textsFor(pkg)
+        val roots = rootsFor(pkg, e)
+        if (roots.isEmpty()) return false
+        val t = ArrayList<String>()
+        for (r in roots) {
+            val part = ArrayList<String>()
+            collect(r, part, 0)
+            t.addAll(part)
+        }
         if (t.isEmpty()) return false
         val open = Policy.uninstallOpen(this)
         val oursAny = t.any { it.contains("secure lock") }
@@ -484,6 +652,14 @@ class GuardService : AccessibilityService() {
         if (!open && oursAny && dlg && Policy.protOn(this, "p_uninst")) {
             noteGuard()
             kick("Kaldırma engelli", pkg)
+            return true
+        }
+
+        // Verileri silme sayfası ve penceresi: veriler silinirse tüm korumalar kaybolur
+        val clr = t.any { s -> CLEAR_W.any { w -> s.contains(w) } }
+        if (!open && oursAny && clr && Policy.protOn(this, "p_info")) {
+            noteGuard()
+            kick("Veri silme engelli", pkg)
             return true
         }
 
@@ -506,12 +682,13 @@ class GuardService : AccessibilityService() {
             return true
         }
 
-        // Ayarlar > Uygulamalar > Secure Lock bilgi sayfası
+        // Ayarlar > Uygulamalar > Secure Lock bilgi sayfası: önce düğmelerin üstünü örter, sonra atar
         if (oursExact) {
-            val head = t.take(14).any { it == "secure lock" }
+            val hd = t.take(14).any { it == "secure lock" }
             val info = t.any { INFO_W.contains(it) }
-            if (!open && ((head && (kp || mode != 0)) || (info && Policy.protOn(this, "p_info")))) {
+            if (!open && ((hd && (kp || mode != 0)) || (info && Policy.protOn(this, "p_info")))) {
                 noteGuard()
+                startMask(pkg, roots)
                 kick("Secure Lock korumalı", pkg)
                 return true
             }
@@ -522,7 +699,12 @@ class GuardService : AccessibilityService() {
         for (pg in Pages.all) {
             if (head.none { pg.t.contains(it) }) continue
             val key = "pg:" + pg.id
-            val b = Policy.pageInfo(this, pg.id)
+            var b = Policy.pageInfo(this, pg.id)
+            val ul = Policy.ulockLeft(this)
+            // Kaldırma kilidi sürerken erişilebilirliği kapatıp korumayı düşürmek de engelli
+            if (b.kind < 2 && ul > 0L && (pg.id == "acc" || pg.id == "date" || pg.id == "gm" || pg.id == "admin")) {
+                b = Blk(2, ul)
+            }
             if (b.kind >= 2) {
                 enforce(key, null, b, pg.name, null)
                 return true
@@ -536,7 +718,7 @@ class GuardService : AccessibilityService() {
     }
 
     private fun collect(n: AccessibilityNodeInfo?, out: ArrayList<String>, d: Int) {
-        if (n == null || out.size >= 140 || d > 30) return
+        if (n == null || out.size >= 220 || d > 30) return
         val t = n.text
         if (t != null && t.isNotEmpty()) out.add(norm(t.toString()))
         val cd = n.contentDescription
